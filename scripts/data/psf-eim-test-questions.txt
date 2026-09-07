@@ -1,0 +1,7 @@
+# Test questions for psf_eim_kb — one per line, '#' starts a comment.
+# Run with: python3 scripts/rag_query.py --collection psf_eim_kb --queries-file scripts/data/psf-eim-test-questions.txt
+PSF EIM 的五大產品矩陣是什麼？
+Decision Matrix 的核心模組有哪些？
+PSF EIM 跟一般 ERP/CRM 有什麼不同？
+PSF EIM 裡負責客戶服務的 Agent 是誰？
+企業智慧架構總共分成幾層？
