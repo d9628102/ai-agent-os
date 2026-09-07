@@ -5,8 +5,14 @@
 # Idempotent setup script for ASUS Ascent GX10 / NVIDIA DGX Spark (GB10,
 # Grace Blackwell, ARM64/aarch64, SM_121). Covers:
 #   Step 2: Docker Engine + nvidia-container-toolkit install & GPU verify
+#   Step 2.5: Driver version gate (fails fast, BEFORE Step 3, if the driver
+#             is too old for the NGC vLLM image — see docs/gx10-known-issues.md)
 #   Step 3: GB10/DGX Spark compatibility check + vLLM container launch
 #   Step 4: Startup-log wait + curl inference smoke test + summary
+#
+# Known issues hit on real GX10 hardware (driver upgrade, Secure Boot/MOK
+# enrollment, HF_TOKEN rate limiting, RAM headroom) are documented in
+# docs/gx10-known-issues.md — read it before running this on a new machine.
 #
 # MUST be run directly on the target machine (not in a container/VM) as a
 # user with sudo privileges. Re-running is safe: every step checks current
@@ -32,6 +38,12 @@ TARGET_USER="${TARGET_USER:-${SUDO_USER:-$(whoami)}}"
 NGC_VLLM_IMAGE="${NGC_VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.05-py3}"
 FALLBACK_VLLM_IMAGE="${FALLBACK_VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}"
 NGC_API_KEY="${NGC_API_KEY:-}"
+
+# Minimum driver version required by NGC_VLLM_IMAGE. GX10 factory image can
+# ship with an older driver (e.g. 580.x) that is too old — see
+# docs/gx10-known-issues.md #1/#2 for the upgrade + Secure Boot/MOK steps.
+MIN_DRIVER_VERSION="${MIN_DRIVER_VERSION:-595.58}"
+ALLOW_OLD_DRIVER="${ALLOW_OLD_DRIVER:-0}"
 
 MODEL_HANDLE="${MODEL_HANDLE:-Qwen/Qwen3-30B-A3B}"
 QUANTIZATION="${QUANTIZATION:-}"           # e.g. awq, fp8, nvfp4 — empty = let vLLM decide
@@ -67,6 +79,15 @@ require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     die "此腳本需要 root/sudo 權限才能安裝套件與設定 Docker。請用: sudo $0"
   fi
+}
+
+# version_ge A B -> true (0) if version A >= version B, using natural
+# version sort (handles "580.159.03" vs "595.58" correctly).
+version_ge() {
+  [[ "$1" == "$2" ]] && return 0
+  local smaller
+  smaller="$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)"
+  [[ "${smaller}" != "$1" ]]
 }
 
 # ============================================================================
@@ -195,6 +216,38 @@ install_nvidia_container_toolkit() {
   fi
   log "容器內 GPU 驗證成功,內容如下:"
   cat /tmp/docker-gpu-smoke-test.log
+}
+
+# ============================================================================
+# STEP 2.5: DRIVER VERSION CHECK (run BEFORE Step 3, not after container fails)
+# ============================================================================
+check_driver_version() {
+  step "Step 2.5/4: 檢查驅動版本是否符合 NGC 官方 vLLM 映像需求"
+
+  local driver_version
+  driver_version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d '[:space:]')"
+  log "目前驅動版本: ${driver_version}(NGC 映像 ${NGC_VLLM_IMAGE} 要求 ${MIN_DRIVER_VERSION}+)"
+
+  if version_ge "${driver_version}" "${MIN_DRIVER_VERSION}"; then
+    log "驅動版本符合需求,繼續 Step 3。"
+    return 0
+  fi
+
+  warn "驅動版本 ${driver_version} 低於官方 NGC vLLM 映像要求的 ${MIN_DRIVER_VERSION}+。"
+  warn "已知問題與解法(詳見 docs/gx10-known-issues.md):"
+  warn "  1) 升級驅動: sudo apt update && sudo apt install nvidia-driver-595-open && sudo reboot"
+  warn "  2) 若此機器啟用 Secure Boot,升級後重開機核心模組可能被拒絕載入:"
+  warn "       modprobe: ERROR: could not insert 'nvidia': Key was rejected by service"
+  warn "     解法: sudo mokutil --import /var/lib/shim-signed/mok/MOK.der"
+  warn "     設定一次性密碼後 reboot,並在下次開機時於【實體螢幕】手動完成 MOK Manager 註冊:"
+  warn "       Enroll MOK -> Continue -> Yes -> 輸入密碼 -> Reboot"
+  warn "     此步驟無法透過 SSH 遠端完成,請安排有人能在現場或用 KVM 操作。"
+
+  if [[ "${ALLOW_OLD_DRIVER}" == "1" ]]; then
+    warn "ALLOW_OLD_DRIVER=1,依你的指示忽略此檢查繼續執行(NGC 官方映像仍可能啟動失敗,建議搭配 fallback 映像)。"
+  else
+    die "驅動版本不足,已在 Step 3 開始前中止,避免等到 container 啟動失敗才發現。請先完成上面兩步升級後再重跑本腳本;若確定要略過此檢查,設定環境變數 ALLOW_OLD_DRIVER=1 後重跑。"
+  fi
 }
 
 # ============================================================================
@@ -472,6 +525,7 @@ main() {
   check_preconditions
   install_docker_engine
   install_nvidia_container_toolkit
+  check_driver_version
   check_gb10_compatibility
   select_vllm_image
   run_vllm_container
