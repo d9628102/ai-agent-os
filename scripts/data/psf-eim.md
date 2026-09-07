@@ -134,7 +134,11 @@ PSF CEO Agent™、PSF COO Agent™、PSF CFO Agent™、PSF CIO Agent™、PSF 
 
 ### Business Agents
 
-PSF Sales Agent™、PSF Marketing Agent™、PSF Customer Success Agent™、PSF HR Agent™、PSF Procurement Agent™。
+- PSF Sales Agent™ —— 負責業務開發與成交推進
+- PSF Marketing Agent™ —— 負責行銷內容與活動規劃
+- PSF Customer Success Agent™ —— 負責客戶成功、續約與滿意度維繫
+- PSF HR Agent™ —— 負責人力資源與招募流程
+- PSF Procurement Agent™ —— 負責採購與供應商管理
 
 ### Professional Agents
 
