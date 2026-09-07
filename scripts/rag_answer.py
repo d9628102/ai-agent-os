@@ -216,8 +216,10 @@ def main():
     ap.add_argument("--show-think", action="store_true", help="顯示 <think> 推理內容")
     ap.add_argument("--show-context", action="store_true", help="顯示送進模型的完整片段")
     ap.add_argument("--no-think", action="store_true",
-                    help="關閉 Qwen3 的思考模式。有依據的問答本質是從片段中擷取而非推導，"
-                         "實測推理內容佔輸出一半以上，關掉可大幅縮短回應時間")
+                    help="關閉 Qwen3 的思考模式。GX10 實測平均端到端 18.63s -> 3.87s "
+                         "(4.8 倍)，因為約 81%% 的輸出是使用者看不到的推理內容。事實正確性"
+                         "與防幻覺未退步，但回答較簡潔，易混淆或需完整列舉的問題可能遺漏"
+                         "辨析細節 —— 已知限制與待補測見 docs/rag-findings.md")
     args = ap.parse_args()
 
     questions = list(args.questions)
