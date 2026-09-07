@@ -8,7 +8,7 @@
 #
 #   Step 4.1: Qdrant (vector DB) — docker run + /healthz verification
 #   Step 4.2: BGE-M3 embedding service via a SECOND vLLM container
-#             (--task embed), reusing the same NGC image already validated
+#             (--runner pooling), reusing the same NGC image already validated
 #             on this hardware — see docs/gx10-known-issues.md for why a
 #             raw sentence-transformers install is avoided on GB10/ARM64.
 #   Step 4.3: Test collection + ingestion + semantic search
@@ -198,7 +198,7 @@ check_gpu_headroom() {
 }
 
 # ============================================================================
-# STEP 4.2: EMBEDDING SERVICE (BGE-M3 via vLLM --task embed)
+# STEP 4.2: EMBEDDING SERVICE (BGE-M3 via vLLM --runner pooling)
 # ============================================================================
 start_embedding_service() {
   step "Step 4.2/4: 啟動 BGE-M3 embedding 服務"
@@ -208,12 +208,16 @@ start_embedding_service() {
   mkdir -p "${HF_CACHE_DIR}" || die "建立 Hugging Face 快取目錄 ${HF_CACHE_DIR} 失敗。"
 
   if docker inspect "${EMBED_CONTAINER_NAME}" &>/dev/null; then
-    local state
+    local state restart_count
     state="$(docker inspect -f '{{.State.Running}}' "${EMBED_CONTAINER_NAME}")"
-    if [[ "${state}" == "true" ]]; then
-      log "容器 '${EMBED_CONTAINER_NAME}' 已在執行中,略過重新建立。若要換模型/參數,請先 'docker rm -f ${EMBED_CONTAINER_NAME}' 再重跑。"
+    restart_count="$(docker inspect -f '{{.RestartCount}}' "${EMBED_CONTAINER_NAME}" 2>/dev/null || echo 0)"
+    if [[ "${state}" == "true" && "${restart_count}" -lt 3 ]]; then
+      log "容器 '${EMBED_CONTAINER_NAME}' 已在執行中且穩定(RestartCount=${restart_count}),略過重新建立。若要換模型/參數,請先 'docker rm -f ${EMBED_CONTAINER_NAME}' 再重跑。"
       SKIP_WAIT_FOR_EMBED_STARTUP=1
       return 0
+    elif [[ "${restart_count}" -ge 3 ]]; then
+      warn "容器 '${EMBED_CONTAINER_NAME}' 的 RestartCount=${restart_count},疑似因參數錯誤陷入 crash loop(--restart unless-stopped 會無限重試)。強制移除重建: docker rm -f ${EMBED_CONTAINER_NAME}"
+      docker rm -f "${EMBED_CONTAINER_NAME}" &>/dev/null || die "強制移除 crash-loop 容器 ${EMBED_CONTAINER_NAME} 失敗。"
     else
       log "發現已存在但未在執行的同名容器,先移除: docker rm ${EMBED_CONTAINER_NAME}"
       docker rm "${EMBED_CONTAINER_NAME}" &>/dev/null || die "移除舊容器 ${EMBED_CONTAINER_NAME} 失敗。"
@@ -230,7 +234,7 @@ start_embedding_service() {
     warn "未設定 HF_TOKEN,下載 ${EMBED_MODEL_HANDLE} 可能被 Hugging Face Hub 限速(見 docs/gx10-known-issues.md #3)。"
   fi
 
-  log "執行: docker run -d --name ${EMBED_CONTAINER_NAME} --gpus all -p ${EMBED_PORT}:8000 ... vllm serve ${EMBED_MODEL_HANDLE} --task embed"
+  log "執行: docker run -d --name ${EMBED_CONTAINER_NAME} --gpus all -p ${EMBED_PORT}:8000 ... vllm serve ${EMBED_MODEL_HANDLE} --runner pooling"
 
   EMBED_START_TS="$(date +%s)"
 
@@ -243,7 +247,7 @@ start_embedding_service() {
     "${hf_token_args[@]}" \
     "${EMBED_VLLM_IMAGE}" \
     vllm serve "${EMBED_MODEL_HANDLE}" \
-      --task embed \
+      --runner pooling \
       --host 0.0.0.0 \
       --port 8000 \
       --gpu-memory-utilization "${EMBED_GPU_MEM_UTIL}" \
@@ -269,7 +273,7 @@ wait_for_embed_ready() {
     if ! docker inspect -f '{{.State.Running}}' "${EMBED_CONTAINER_NAME}" 2>/dev/null | grep -q true; then
       warn "容器提早結束,完整 log 如下:"
       docker logs "${EMBED_CONTAINER_NAME}" >&2 || true
-      die "embedding 容器在載入模型過程中結束(crash)。請看上面完整 log 找出原因(常見:OOM、下載失敗、模型不支援 --task embed)。"
+      die "embedding 容器在載入模型過程中結束(crash)。請看上面完整 log 找出原因(常見:OOM、下載失敗、模型不支援 --runner pooling)。"
     fi
 
     local logs
@@ -392,7 +396,7 @@ Qdrant:
   持久化驗證(重啟後):   $([[ "${QDRANT_PERSISTENCE_OK:-0}" == "1" ]] && echo "通過" || echo "未驗證/失敗")
 
 Embedding 服務:
-  方案:                 vLLM --task embed (與主模型共用已驗證的 NGC 映像)
+  方案:                 vLLM --runner pooling (與主模型共用已驗證的 NGC 映像)
   模型:                 ${EMBED_MODEL_HANDLE}
   容器名稱:              ${EMBED_CONTAINER_NAME}
   Port:                  ${EMBED_PORT}
