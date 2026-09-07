@@ -161,16 +161,38 @@ check_gpu_headroom() {
   step "檢查 GPU 統一記憶體剩餘空間(BGE-M3 啟動前)"
 
   local mem_line used_mib total_mib free_mib free_gb
-  mem_line="$(nvidia-smi --query-gpu=memory.used,memory.total,memory.free --format=csv,noheader,nounits | head -1)"
-  used_mib="$(echo "${mem_line}" | awk -F',' '{gsub(/ /,"",$1); print $1}')"
-  total_mib="$(echo "${mem_line}" | awk -F',' '{gsub(/ /,"",$2); print $2}')"
-  free_mib="$(echo "${mem_line}" | awk -F',' '{gsub(/ /,"",$3); print $3}')"
-  free_gb="$(awk "BEGIN{printf \"%.1f\", ${free_mib}/1024}")"
+  local num_re='^[0-9]+(\.[0-9]+)?$'
 
-  log "目前 GPU 記憶體: 已用 $(awk "BEGIN{printf \"%.1f\", ${used_mib}/1024}")GB / 總量 $(awk "BEGIN{printf \"%.1f\", ${total_mib}/1024}")GB,剩餘 ${free_gb}GB"
+  mem_line="$(nvidia-smi --query-gpu=memory.used,memory.total,memory.free --format=csv,noheader,nounits | head -1)"
+  log "nvidia-smi 原始輸出: ${mem_line}"
+  used_mib="$(echo "${mem_line}" | awk -F',' '{gsub(/[^0-9.]/,"",$1); print $1}')"
+  total_mib="$(echo "${mem_line}" | awk -F',' '{gsub(/[^0-9.]/,"",$2); print $2}')"
+  free_mib="$(echo "${mem_line}" | awk -F',' '{gsub(/[^0-9.]/,"",$3); print $3}')"
+
+  if [[ ! "${total_mib}" =~ ${num_re} ]]; then
+    warn "nvidia-smi 沒有回傳可解析的 memory.total(拿到 '${total_mib}'),略過記憶體 headroom 檢查,直接繼續啟動 embedding 服務。"
+    return 0
+  fi
+
+  if [[ ! "${free_mib}" =~ ${num_re} ]]; then
+    if [[ "${used_mib}" =~ ${num_re} ]]; then
+      warn "nvidia-smi 沒有回報 memory.free(GB10 統一記憶體架構常見此狀況),改用 total - used 推算剩餘空間。"
+      free_mib="$(awk "BEGIN{printf \"%.0f\", ${total_mib} - ${used_mib}}")"
+    else
+      warn "nvidia-smi 沒有回傳可解析的 memory.used/memory.free(used='${used_mib}', free='${free_mib}'),略過記憶體 headroom 檢查,直接繼續啟動 embedding 服務。"
+      return 0
+    fi
+  fi
+
+  free_gb="$(awk "BEGIN{printf \"%.1f\", ${free_mib}/1024}")"
+  local used_gb_display total_gb_display
+  used_gb_display="$([[ "${used_mib}" =~ ${num_re} ]] && awk "BEGIN{printf \"%.1f\", ${used_mib}/1024}" || echo "N/A")"
+  total_gb_display="$(awk "BEGIN{printf \"%.1f\", ${total_mib}/1024}")"
+
+  log "目前 GPU 記憶體: 已用 ${used_gb_display}GB / 總量 ${total_gb_display}GB,剩餘(推算)約 ${free_gb}GB"
 
   if awk "BEGIN{exit !(${free_gb} < ${MIN_FREE_MEM_GB})}"; then
-    die "剩餘 GPU 記憶體只有 ${free_gb}GB,低於安全門檻 ${MIN_FREE_MEM_GB}GB。BAAI/bge-m3 本身很小(fp16 約 1.1GB),但仍建議先確認主要 vLLM 服務(Qwen3-30B-A3B)沒有把記憶體用滿。可調降 MIN_FREE_MEM_GB 環境變數強制略過此檢查,或先降低主模型的 --gpu-memory-utilization。"
+    die "剩餘 GPU 記憶體約 ${free_gb}GB,低於安全門檻 ${MIN_FREE_MEM_GB}GB。BAAI/bge-m3 本身很小(fp16 約 1.1GB),但仍建議先確認主要 vLLM 服務(Qwen3-30B-A3B)沒有把記憶體用滿。可調降 MIN_FREE_MEM_GB 環境變數強制略過此檢查,或先降低主模型的 --gpu-memory-utilization。"
   fi
   log "剩餘記憶體足夠,繼續啟動 embedding 服務。"
 }
