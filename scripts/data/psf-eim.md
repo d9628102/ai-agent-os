@@ -44,6 +44,8 @@ AI 可以每天完成數萬個決策，但全部來自同一套 Decision Logic�
 
 ## PSF EIM 五大產品矩陣
 
+五大產品矩陣依序為：PSF EIM Decision Matrix™（決策智慧中樞）、PSF EIM Knowledge Matrix™（組織智慧中心）、PSF EIM Service Matrix™（智慧服務入口）、PSF EIM Factory Matrix™（智慧生產中心）、PSF EIM Legacy Matrix™（企業與家族治理智慧平台）。
+
 ### ① PSF EIM Decision Matrix™（原 CEO AI HUB）
 
 Position：Enterprise Decision Intelligence Center（企業決策智慧中樞）
