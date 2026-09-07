@@ -395,8 +395,17 @@ verify_qdrant_persistence() {
 print_summary() {
   step "總結"
 
-  local gpu_mem
+  local gpu_mem embed_load_display
   gpu_mem="$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null || echo "N/A")"
+  if ! echo "${gpu_mem}" | grep -Eq '[0-9]'; then
+    gpu_mem="無法從 host nvidia-smi 取得(已知 GB10 限制,見 docs/gx10-known-issues.md #6)。請直接執行不帶 --query-gpu 的 'nvidia-smi' 查看記憶體表格。"
+  fi
+
+  if [[ -n "${EMBED_LOAD_SECONDS:-}" ]]; then
+    embed_load_display="${EMBED_LOAD_SECONDS} 秒"
+  else
+    embed_load_display="不適用(本次執行沿用既有容器,未重新啟動)"
+  fi
 
   cat <<SUMMARY
 
@@ -411,7 +420,7 @@ Embedding 服務:
   模型:                 ${EMBED_MODEL_HANDLE}
   容器名稱:              ${EMBED_CONTAINER_NAME}
   Port:                  ${EMBED_PORT}
-  啟動耗時:              ${EMBED_LOAD_SECONDS:-N/A} 秒
+  啟動耗時:              ${embed_load_display}
   向量維度:              ${EMBED_VECTOR_SIZE}(已驗證)
   --gpu-memory-utilization: ${EMBED_GPU_MEM_UTIL}
 
