@@ -14,14 +14,19 @@ Flow per question:
   5. Strip Qwen3's <think> reasoning from what's shown, and report
      per-stage plus end-to-end timing
 
-Qwen3 emits its chain of thought inside <think>...</think>. That is hidden
-by default (see split_think for the four shapes it can arrive in) — pass
---show-think to see it.
+Thinking mode is OFF by default for Phase 1 (speed first: 4.8x faster
+end-to-end, with fact accuracy and the grounding guard both holding in
+testing). Pass --think for questions where disambiguation matters — see
+docs/rag-findings.md for the measured trade-off and its caveats.
+
+When thinking is on, Qwen3 emits its chain of thought inside
+<think>...</think>. That is stripped from the answer (see split_think for
+the four shapes it can arrive in) — pass --show-think to display it.
 
 Usage:
   python3 rag_answer.py "PSF EIM 的五大產品矩陣是什麼？"
   python3 rag_answer.py --queries-file scripts/data/psf-eim-qa-questions.txt
-  python3 rag_answer.py --show-think --show-context "..."
+  python3 rag_answer.py --think --show-think "..."
 """
 import argparse
 import os
@@ -102,7 +107,7 @@ def build_context(hits):
 
 
 def generate(question: str, context: str, max_tokens: int, temperature: float,
-             enable_thinking: bool = True):
+             enable_thinking: bool = False):
     user_content = (
         f"以下是從內部文件中檢索到的片段：\n\n{context}\n\n"
         f"---\n\n請根據上方文件片段回答這個問題：{question}"
@@ -138,7 +143,7 @@ def generate(question: str, context: str, max_tokens: int, temperature: float,
 
 
 def answer_one(question, collection, top_k, max_tokens, temperature,
-               show_think, show_context, enable_thinking=True):
+               show_think, show_context, enable_thinking=False):
     print(f"\n{'=' * 72}")
     print(f"Q: {question}")
     print("=" * 72)
@@ -215,11 +220,12 @@ def main():
                     help="低溫度較適合有依據的問答 (預設 0.2)")
     ap.add_argument("--show-think", action="store_true", help="顯示 <think> 推理內容")
     ap.add_argument("--show-context", action="store_true", help="顯示送進模型的完整片段")
-    ap.add_argument("--no-think", action="store_true",
-                    help="關閉 Qwen3 的思考模式。GX10 實測平均端到端 18.63s -> 3.87s "
-                         "(4.8 倍)，因為約 81%% 的輸出是使用者看不到的推理內容。事實正確性"
-                         "與防幻覺未退步，但回答較簡潔，易混淆或需完整列舉的問題可能遺漏"
-                         "辨析細節 —— 已知限制與待補測見 docs/rag-findings.md")
+    ap.add_argument("--think", action="store_true",
+                    help="開啟 Qwen3 的思考模式。Phase 1 預設為關閉(速度優先)："
+                         "GX10 實測關閉後平均端到端 18.63s -> 3.87s(4.8 倍)，因為約 81%% "
+                         "的輸出是使用者看不到的推理內容，且事實正確性與防幻覺未退步。"
+                         "但關閉後對「命名易混淆」或「需完整列舉」的問題可能遺漏辨析細節，"
+                         "這類問題建議加上本開關 —— 取捨細節與待補測見 docs/rag-findings.md")
     args = ap.parse_args()
 
     questions = list(args.questions)
@@ -234,12 +240,12 @@ def main():
 
     ensure_collection(args.collection, create=False)
     log(f"檢索 top_k={args.top_k}，生成模型 {CHAT_MODEL} @ {CHAT_URL}"
-        f"，思考模式 {'關閉' if args.no_think else '開啟'}")
+        f"，思考模式 {'開啟' if args.think else '關閉(Phase 1 預設，速度優先)'}")
 
     results = [
         answer_one(q, args.collection, args.top_k, args.max_tokens,
                    args.temperature, args.show_think, args.show_context,
-                   enable_thinking=not args.no_think)
+                   enable_thinking=args.think)
         for q in questions
     ]
 
