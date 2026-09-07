@@ -174,11 +174,55 @@ memory.total,memory.free` 會**整組回傳 `[N/A]`**,不只 `memory.free`。
 3. 兩個服務的 `--gpu-memory-utilization` 加總必須留有餘裕(不能接近
    1.0),因為兩者都是各自對「總量」的保留,不是對「剩餘量」的保留。
 
+## 7. HF_TOKEN 含非 ASCII 字元導致 vLLM 啟動時 crash-loop
+
+**現象**:設定好 `HF_TOKEN`(見問題 3 的解法)後,`vllm-embed` 容器不斷
+restart(`docker ps` 顯示 `Up 1 second` 但 `Created` 是好幾分鐘前),
+`docker logs` 裡看到:
+
+```
+UnicodeEncodeError: 'ascii' codec can't encode characters in position 7-10: ordinal not in range(128)
+```
+
+同時對該服務的所有 API 呼叫都得到 `ConnectionResetError` /
+`curl: Recv failure: 連線被對方重設`,因為容器根本沒有真正啟動起來過。
+
+**原因**:`HF_TOKEN` 裡混進了看不見的非 ASCII 字元(全形空格、智慧引號、
+零寬字元等),通常是複製貼上時夾帶的。vLLM 用這個 token 組
+`Authorization: Bearer <token>` HTTP header 時,Python 的 httpx 函式庫
+預設用 ASCII 編碼 header 值,遇到非 ASCII 字元直接丟
+`UnicodeEncodeError`,整個程序在下載模型 config 這一步就崩潰。錯誤位置
+「position 7-10」不是巧合——`"Bearer "` 剛好是 7 個字元,所以壞字元就在
+token 開頭附近。
+
+**解法**:兩支腳本的 `load_hf_token()` 現在會在使用 token 前自動:
+
+1. 去除頭尾空白、CRLF、外層引號
+2. 用 Python 逐字元檢查是否為 ASCII(**不是**用 bash 的
+   `[[:ascii:]]` — 這個 POSIX character class 在部分 locale 下不可靠,
+   實測連純 ASCII 字串都會誤判為不符合,已改用 Python 檢查)
+3. 一旦發現非 ASCII 字元,**在容器啟動前**就 `die`,並精確印出是第幾個
+   字元、對應的 Unicode 碼位(例如 `第 1 個字元: '　' (U+3000)`),
+   不會再讓這個問題一路埋到 vLLM 內部才用一段難懂的 Python traceback
+   表現出來
+
+同時修掉一個相關的 CRLF 問題:若 `~/.config/gx10-llm/env` 是用會存成
+Windows 換行(`\r\n`)的編輯器建立的,原本直接 `source` 這個檔案會先因為
+`$'\r': command not found` 而失敗,連 HF_TOKEN 都讀不到。現在會先用
+`tr -d '\r'` 過濾掉 `\r` 再 source。
+
+**如果你也踩到這個錯誤**,建議重新寫入 token 檔案,避免用會自動排版/
+轉換引號的編輯器或聊天視窗複製貼上:
+```bash
+printf '%s' 'HF_TOKEN=hf_你的真實token' > ~/.config/gx10-llm/env
+chmod 600 ~/.config/gx10-llm/env
+```
+
 ## 相關檔案
 
 - 建置腳本:[`scripts/gx10-vllm-setup.sh`](../scripts/gx10-vllm-setup.sh)
   — 已內建 Step 3 前的驅動版本檢查(對應本文件問題 1),`GPU_MEM_UTIL`
-  預設 0.75(對應問題 6)。
+  預設 0.75(對應問題 6),HF_TOKEN 載入前會做 ASCII 驗證(對應問題 7)。
 - RAG 基礎設施腳本:[`scripts/gx10-rag-setup.sh`](../scripts/gx10-rag-setup.sh)
   + [`scripts/rag_smoke_test.py`](../scripts/rag_smoke_test.py)
   — Qdrant + BGE-M3 embedding(`--runner pooling`,對應問題 5)+

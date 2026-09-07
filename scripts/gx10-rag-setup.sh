@@ -88,10 +88,43 @@ require_root() {
   fi
 }
 
+# Strip CR/whitespace/surrounding quotes, then die with a precise diagnostic
+# if what's left isn't pure ASCII. A non-ASCII HF_TOKEN (typically an
+# invisible character picked up from a copy-paste) doesn't fail here — it
+# fails deep inside vLLM/httpx when it tries to encode the
+# "Authorization: Bearer <token>" header, crashing the container in a loop
+# with a cryptic UnicodeEncodeError. See docs/gx10-known-issues.md #7.
+sanitize_and_validate_hf_token() {
+  HF_TOKEN="$(printf '%s' "${HF_TOKEN}" | tr -d '\r\n')"
+  HF_TOKEN="${HF_TOKEN%\"}"; HF_TOKEN="${HF_TOKEN#\"}"
+  HF_TOKEN="${HF_TOKEN%\'}"; HF_TOKEN="${HF_TOKEN#\'}"
+  HF_TOKEN="$(printf '%s' "${HF_TOKEN}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+  [[ -z "${HF_TOKEN}" ]] && return 0
+
+  # Bash's [[:ascii:]] POSIX class is unreliable across locales (observed to
+  # reject even pure-ASCII input under LC_CTYPE=POSIX), so check with
+  # Python instead — passed via env var, never string-interpolated.
+  local bad_chars
+  bad_chars="$(HF_TOKEN="${HF_TOKEN}" python3 -c '
+import os
+t = os.environ["HF_TOKEN"]
+for i, c in enumerate(t):
+    if ord(c) > 127:
+        print(f"  第 {i + 1} 個字元: {c!r} (U+{ord(c):04X})")
+')"
+  if [[ -n "${bad_chars}" ]]; then
+    warn "HF_TOKEN 含有非 ASCII 字元,詳細位置如下:"
+    echo "${bad_chars}" >&2
+    die "HF_TOKEN 不是純 ASCII,vLLM 組 'Authorization: Bearer <token>' header 時會直接 crash(UnicodeEncodeError),容器會不斷 restart-loop 且完全連不上。常見原因是複製貼上時混入全形空格/智慧引號/零寬字元。請用純文字編輯器重新輸入 token 到 ${HF_ENV_FILE},或改用: printf '%s' 'hf_你的token' > ${HF_ENV_FILE} 的方式寫入(避免編輯器自動排版)。"
+  fi
+}
+
 # Load HF_TOKEN from HF_ENV_FILE when it isn't already in the environment.
 # The token value is NEVER echoed — only a masked prefix and its length.
 load_hf_token() {
   if [[ -n "${HF_TOKEN}" ]]; then
+    sanitize_and_validate_hf_token
     log "HF_TOKEN 由環境變數提供 (${HF_TOKEN:0:5}…,共 ${#HF_TOKEN} 字元)。"
     return 0
   fi
@@ -103,11 +136,15 @@ load_hf_token() {
       warn "${HF_ENV_FILE} 的權限是 ${perms},建議收緊為 600: chmod 600 ${HF_ENV_FILE}"
     fi
     set -a
+    # CRLF (Windows) line endings would otherwise break `source` outright
+    # ("$'\r': command not found") before HF_TOKEN is ever read — strip
+    # them via process substitution instead of sourcing the raw file.
     # shellcheck disable=SC1090
-    source "${HF_ENV_FILE}"
+    source <(tr -d '\r' < "${HF_ENV_FILE}")
     set +a
     HF_TOKEN="${HF_TOKEN:-}"
     if [[ -n "${HF_TOKEN}" ]]; then
+      sanitize_and_validate_hf_token
       log "已從 ${HF_ENV_FILE} 載入 HF_TOKEN (${HF_TOKEN:0:5}…,共 ${#HF_TOKEN} 字元)。"
       return 0
     fi
