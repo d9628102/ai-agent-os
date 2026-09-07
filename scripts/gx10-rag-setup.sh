@@ -46,9 +46,14 @@ EMBED_MODEL_HANDLE="${EMBED_MODEL_HANDLE:-BAAI/bge-m3}"
 EMBED_PORT="${EMBED_PORT:-8001}"
 EMBED_VECTOR_SIZE="${EMBED_VECTOR_SIZE:-1024}"
 # BGE-M3 is ~568M params (~1.1GB fp16) — a tiny fraction of what the main
-# Qwen3-30B-A3B vLLM server needs. Keep this small and explicit so it
-# doesn't fight the main server for unified-memory headroom.
-EMBED_GPU_MEM_UTIL="${EMBED_GPU_MEM_UTIL:-0.08}"
+# Qwen3-30B-A3B vLLM server needs. IMPORTANT: this is a fraction of TOTAL
+# device memory (like the main server's GPU_MEM_UTIL), not of whatever is
+# currently free — vLLM reserves that whole fraction upfront. On a
+# 121.63GB GB10, 0.08 alone requests ~9.73GB, which can exceed what's
+# actually left if the main server's own GPU_MEM_UTIL wasn't lowered first
+# (see gx10-vllm-setup.sh's GPU_MEM_UTIL, default 0.75). Keep this small —
+# see docs/gx10-known-issues.md #5.
+EMBED_GPU_MEM_UTIL="${EMBED_GPU_MEM_UTIL:-0.03}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-/home/${TARGET_USER}/.cache/huggingface}"
 HF_TOKEN="${HF_TOKEN:-}"
 EMBED_STARTUP_TIMEOUT="${EMBED_STARTUP_TIMEOUT:-600}"
@@ -170,7 +175,7 @@ check_gpu_headroom() {
   free_mib="$(echo "${mem_line}" | awk -F',' '{gsub(/[^0-9.]/,"",$3); print $3}')"
 
   if [[ ! "${total_mib}" =~ ${num_re} ]]; then
-    warn "nvidia-smi 沒有回傳可解析的 memory.total(拿到 '${total_mib}'),略過記憶體 headroom 檢查,直接繼續啟動 embedding 服務。"
+    warn "nvidia-smi 沒有回傳可解析的 memory.total(拿到 '${total_mib}')。這台 GX10 上 host 層級的 'nvidia-smi --query-gpu=memory.*' 已知會整組回傳 N/A(見 docs/gx10-known-issues.md #5),此事前檢查形同略過。實際記憶體是否足夠會在容器啟動時由 vLLM 自己判斷並在 log 中報錯(本腳本會攔截並給出明確訊息),直接繼續啟動 embedding 服務。"
     return 0
   fi
 
@@ -278,6 +283,12 @@ wait_for_embed_ready() {
 
     local logs
     logs="$(docker logs "${EMBED_CONTAINER_NAME}" 2>&1 || true)"
+
+    if echo "${logs}" | grep -Eqi 'Free memory on device .* is less than desired GPU memory utilization'; then
+      warn "偵測到記憶體不足錯誤,完整 log 如下:"
+      echo "${logs}" >&2
+      die "GPU 剩餘記憶體不足以啟動 embedding 服務。--gpu-memory-utilization 是相對『總量』預先保留,不是看實際用量 —— 主要 vLLM 服務(vllm-server)目前的 GPU_MEM_UTIL 設定可能已經把大部分統一記憶體吃掉了。解法:降低主服務的 GPU_MEM_UTIL 並重啟(例如 'docker rm -f vllm-server && GPU_MEM_UTIL=0.75 sudo -E ./scripts/gx10-vllm-setup.sh'),或降低本腳本的 EMBED_GPU_MEM_UTIL(目前 ${EMBED_GPU_MEM_UTIL})後再重跑。詳見 docs/gx10-known-issues.md #5。"
+    fi
 
     if echo "${logs}" | grep -Eqi 'sm_121a? not recognized|CUDA error|CUDA out of memory|OutOfMemoryError|Traceback \(most recent call last\)|RuntimeError'; then
       warn "偵測到啟動錯誤訊息,完整 log 如下:"

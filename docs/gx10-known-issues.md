@@ -107,19 +107,79 @@ transformers 函式庫需要手動 patch 才能在 GB10 上正確載入/推論,�
 
 **解法**:既然 Step 3 已經驗證過 NGC 官方 vLLM 映像
 (`nvcr.io/nvidia/vllm:26.05-py3`)在這台機器上能正常運作,直接**用同一個
-映像再起一個容器**,用 `vllm serve BAAI/bge-m3 --task embed` 模式提供
+映像再起一個容器**,用 `vllm serve BAAI/bge-m3 --runner pooling` 模式提供
 OpenAI 相容的 `/v1/embeddings` 端點,完全繞開上述 ARM64 相容性地雷,不用
 再驗證一套新的 Python 環境。BGE-M3 本身只有約 568M 參數(fp16 權重約
-1.1GB),用很小的 `--gpu-memory-utilization`(預設 0.08)即可,不會跟主要
-的 Qwen3-30B-A3B 服務搶記憶體。
+1.1GB),只需要很小的 `--gpu-memory-utilization` 即可,不會跟主要的
+Qwen3-30B-A3B 服務搶記憶體(實際踩到的記憶體衝突見問題 5)。
 
 見 [`scripts/gx10-rag-setup.sh`](../scripts/gx10-rag-setup.sh)。
+
+## 5. 用 `--task embed` 啟動 embedding 服務失敗:`unrecognized arguments`
+
+**現象**:`vllm serve BAAI/bge-m3 --task embed` 在這台機器的 vLLM
+版本(0.20.1,NGC 26.05 映像)直接報錯:
+
+```
+vllm: error: unrecognized arguments: --task embed
+```
+
+且因為容器設了 `--restart unless-stopped`,會無限重試崩潰,同一段錯誤
+在 log 裡重複洗版。
+
+**原因**:vLLM 已把 `--task` 參數廢棄,serve embedding/pooling 類模型
+改用 `--runner pooling`。
+
+**解法**:改用 `vllm serve BAAI/bge-m3 --runner pooling`(已更新進
+`scripts/gx10-rag-setup.sh`)。若容器已經因為舊參數卡在 crash loop,
+腳本會偵測 `RestartCount >= 3` 自動 `docker rm -f` 強制重建,不需要
+手動介入;真的要手動處理的話:`docker rm -f vllm-embed` 後再重跑腳本。
+
+## 6. 主要 vLLM 服務把記憶體整包保留,導致第二個 GPU 服務啟動失敗
+
+**現象**:修好問題 5 之後,`vllm-embed` 容器改成正確的
+`--runner pooling` 啟動,卻在初始化時報錯:
+
+```
+ValueError: Free memory on device cuda:0 (2.6/121.63 GiB) on startup
+is less than desired GPU memory utilization (0.08, 9.73 GiB)
+```
+
+GB10 總共 121.63 GiB 統一記憶體,啟動當下卻只剩 2.6 GiB 可用。
+
+**原因**:`--gpu-memory-utilization` 是「啟動時就把這個比例的**總記憶體**
+整包預先保留」,不是只保留模型權重實際大小。主要服務(`vllm-server`)
+原本預設 `GPU_MEM_UTIL=0.90`,代表一啟動就跟系統要走
+121.63 × 0.90 ≈ **109.5GB**,即使 Qwen3-30B-A3B 權重只有約 58.5GB,
+其餘保留給 KV cache 池,導致同一張卡上幾乎沒有空間再開第二個 GPU 服務。
+
+另外也發現這台機器上 host 層級的 `nvidia-smi --query-gpu=memory.used,
+memory.total,memory.free` 會**整組回傳 `[N/A]`**,不只 `memory.free`。
+因此 `gx10-rag-setup.sh` 裡事前的記憶體 headroom 檢查在這台機器上形同
+略過 —— 真正有效的把關是容器啟動時 vLLM 自己丟出的錯誤,腳本靠監看
+`docker logs` 抓錯誤訊息才攔下這個問題(而不是靜默放行)。
+
+**解法**:
+
+1. 降低主要服務的 `GPU_MEM_UTIL` 並重啟,騰出空間給其他 GPU 服務:
+   ```bash
+   docker rm -f vllm-server
+   GPU_MEM_UTIL=0.75 sudo -E ./scripts/gx10-vllm-setup.sh
+   ```
+   `scripts/gx10-vllm-setup.sh` 的預設值已經從 0.90 調降為 **0.75**
+   (≈91.2GB,仍保留充足 KV cache 空間),讓第二台 GX10 從一開始就有
+   足夠 headroom,不會重演這個問題。
+2. `scripts/gx10-rag-setup.sh` 的 `EMBED_GPU_MEM_UTIL` 預設也從 0.08
+   調降為 **0.03**(≈3.65GB,對 BGE-M3 這種小模型綽綽有餘)。
+3. 兩個服務的 `--gpu-memory-utilization` 加總必須留有餘裕(不能接近
+   1.0),因為兩者都是各自對「總量」的保留,不是對「剩餘量」的保留。
 
 ## 相關檔案
 
 - 建置腳本:[`scripts/gx10-vllm-setup.sh`](../scripts/gx10-vllm-setup.sh)
-  — 已內建 Step 3 前的驅動版本檢查(對應本文件問題 1)。
+  — 已內建 Step 3 前的驅動版本檢查(對應本文件問題 1),`GPU_MEM_UTIL`
+  預設 0.75(對應問題 6)。
 - RAG 基礎設施腳本:[`scripts/gx10-rag-setup.sh`](../scripts/gx10-rag-setup.sh)
   + [`scripts/rag_smoke_test.py`](../scripts/rag_smoke_test.py)
-  — Qdrant + BGE-M3 embedding + collection 建立/寫入/語意搜尋/持久化驗證
-  (對應本文件問題 4)。
+  — Qdrant + BGE-M3 embedding(`--runner pooling`,對應問題 5)+
+  collection 建立/寫入/語意搜尋/持久化驗證(對應本文件問題 4、6)。

@@ -47,7 +47,15 @@ ALLOW_OLD_DRIVER="${ALLOW_OLD_DRIVER:-0}"
 
 MODEL_HANDLE="${MODEL_HANDLE:-Qwen/Qwen3-30B-A3B}"
 QUANTIZATION="${QUANTIZATION:-}"           # e.g. awq, fp8, nvfp4 — empty = let vLLM decide
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
+# NOTE: --gpu-memory-utilization is a fraction of TOTAL device memory that
+# vLLM reserves upfront at startup (not just what the weights need), and it
+# holds that whole reservation for the process's lifetime. On a 121.63GB
+# GB10, 0.90 reserves ~109.5GB even though Qwen3-30B-A3B's weights are only
+# ~58.5GB — leaving almost no room for a second GPU workload (e.g. the
+# BGE-M3 embedding server from scripts/gx10-rag-setup.sh). Default lowered
+# to 0.75 (~91.2GB, still generous KV-cache headroom) to leave ~30GB free
+# for RAG infra. See docs/gx10-known-issues.md #5.
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.75}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 
 CONTAINER_NAME="${CONTAINER_NAME:-vllm-server}"
