@@ -87,8 +87,11 @@ def run_once(queries_file, think: bool, top_k, max_tokens, temperature):
     cmd = [sys.executable, RAG_ANSWER, "--queries-file", queries_file,
            "--top-k", str(top_k), "--max-tokens", str(max_tokens),
            "--temperature", str(temperature)]
-    if think:
-        cmd.append("--think")
+    # Always pass the mode explicitly. Relying on rag_answer.py's default for
+    # either arm would silently run both arms in the same mode whenever that
+    # default changes — and the A/B would compare nothing while still
+    # producing plausible-looking output.
+    cmd.append("--think" if think else "--no-think")
 
     started = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)

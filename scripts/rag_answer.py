@@ -14,10 +14,17 @@ Flow per question:
   5. Strip Qwen3's <think> reasoning from what's shown, and report
      per-stage plus end-to-end timing
 
-Thinking mode is OFF by default for Phase 1 (speed first: 4.8x faster
-end-to-end, with fact accuracy and the grounding guard both holding in
-testing). Pass --think for questions where disambiguation matters — see
-docs/rag-findings.md for the measured trade-off and its caveats.
+Thinking mode is ON by default (DEFAULT_THINKING below). Repeated A/B
+testing showed that without it, questions the document can't actually
+support get a manufactured answer instead of "文件中未提及" — 3/3 of runs,
+against 0/3 with thinking on. It costs roughly 4x in latency. Pass
+--no-think to trade that grounding for speed on a known-safe question,
+or --think to be explicit. See docs/rag-findings.md Known Issue #7.
+
+The planned direction is to switch per question shape rather than
+globally — comparison-style questions get thinking, simple lookups
+don't — at which point DEFAULT_THINKING becomes the fallback for
+anything the detector is unsure about.
 
 When thinking is on, Qwen3 emits its chain of thought inside
 <think>...</think>. That is stripped from the answer (see split_think for
@@ -46,6 +53,14 @@ from rag_common import (  # noqa: E402
 
 CHAT_URL = os.environ.get("CHAT_URL", "http://localhost:8000/v1/chat/completions")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "Qwen/Qwen3-30B-A3B")
+
+# Whether Qwen3 reasons before answering when neither --think nor
+# --no-think is given. This policy has changed more than once, so it lives
+# in one named place and BOTH flags always exist — changing the default
+# must never break a command someone already uses.
+# Currently True: grounding on document-unsupported questions outweighs the
+# ~4x latency (docs/rag-findings.md Known Issue #7).
+DEFAULT_THINKING = True
 
 SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
@@ -107,7 +122,7 @@ def build_context(hits):
 
 
 def generate(question: str, context: str, max_tokens: int, temperature: float,
-             enable_thinking: bool = False):
+             enable_thinking: bool = DEFAULT_THINKING):
     user_content = (
         f"以下是從內部文件中檢索到的片段：\n\n{context}\n\n"
         f"---\n\n請根據上方文件片段回答這個問題：{question}"
@@ -143,7 +158,7 @@ def generate(question: str, context: str, max_tokens: int, temperature: float,
 
 
 def answer_one(question, collection, top_k, max_tokens, temperature,
-               show_think, show_context, enable_thinking=False):
+               show_think, show_context, enable_thinking=DEFAULT_THINKING):
     print(f"\n{'=' * 72}")
     print(f"Q: {question}")
     print("=" * 72)
@@ -220,12 +235,17 @@ def main():
                     help="低溫度較適合有依據的問答 (預設 0.2)")
     ap.add_argument("--show-think", action="store_true", help="顯示 <think> 推理內容")
     ap.add_argument("--show-context", action="store_true", help="顯示送進模型的完整片段")
-    ap.add_argument("--think", action="store_true",
-                    help="開啟 Qwen3 的思考模式。Phase 1 預設為關閉(速度優先)："
-                         "GX10 實測關閉後平均端到端 18.63s -> 3.87s(4.8 倍)，因為約 81%% "
-                         "的輸出是使用者看不到的推理內容，且事實正確性與防幻覺未退步。"
-                         "但關閉後對「命名易混淆」或「需完整列舉」的問題可能遺漏辨析細節，"
-                         "這類問題建議加上本開關 —— 取捨細節與待補測見 docs/rag-findings.md")
+    think_group = ap.add_mutually_exclusive_group()
+    think_group.add_argument(
+        "--think", dest="think", action="store_true", default=None,
+        help=f"明確開啟 Qwen3 的思考模式(目前預設"
+             f"{'開啟' if DEFAULT_THINKING else '關閉'})。比較型問題、"
+             f"或涉及多個相似命名實體的問題建議開啟")
+    think_group.add_argument(
+        "--no-think", dest="think", action="store_false", default=None,
+        help="明確關閉思考模式，換取約 4 倍速度。代價：文件無法支撐的問題"
+             "(例如「跟 X 有什麼不同」但文件從未描述 X)會被硬湊出答案而非"
+             "回答「文件中未提及」，實測 3/3 發生 —— 見 docs/rag-findings.md")
     args = ap.parse_args()
 
     questions = list(args.questions)
@@ -238,14 +258,17 @@ def main():
     if not questions:
         die("請至少提供一個問題(位置參數)或用 --queries-file 指定檔案。")
 
+    enable_thinking = DEFAULT_THINKING if args.think is None else args.think
+    source = "預設" if args.think is None else "指定"
+
     ensure_collection(args.collection, create=False)
     log(f"檢索 top_k={args.top_k}，生成模型 {CHAT_MODEL} @ {CHAT_URL}"
-        f"，思考模式 {'開啟' if args.think else '關閉(Phase 1 預設，速度優先)'}")
+        f"，思考模式 {'開啟' if enable_thinking else '關閉'}({source})")
 
     results = [
         answer_one(q, args.collection, args.top_k, args.max_tokens,
                    args.temperature, args.show_think, args.show_context,
-                   enable_thinking=args.think)
+                   enable_thinking=enable_thinking)
         for q in questions
     ]
 
