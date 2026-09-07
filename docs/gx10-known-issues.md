@@ -93,7 +93,33 @@ Face Hub 的下載請求被**限速**;同時該模型權重約 **56.87GB**,非�
      **量化版本**(AWQ / FP8 / NVFP4,依相容性)以降低權重佔用,換取
      auto-prefetch 能重新開啟、縮短載入時間。
 
+## 4. RAG embedding 服務(BGE-M3)選擇用 vLLM 而非 sentence-transformers
+
+**背景**:Step 4 需要另外起一個 embedding 服務(BGE-M3)給 Qdrant 用。
+原本考慮的兩個方案是 vLLM 的 embedding 端點,或直接用
+`sentence-transformers` 跑。
+
+**查證結果**:在 GB10/ARM64(aarch64 + Blackwell)上,直接用一般 pip 版
+`sentence-transformers`/`transformers` 常會撞到已知相容性問題 —— 官方
+transformers 函式庫需要手動 patch 才能在 GB10 上正確載入/推論,常見錯誤
+是缺少 `kernels-community/vllm-flash-attn3` 導致的 `FileNotFoundError`/
+`KeyError`,原因是一般 pip 版 PyTorch 沒有針對 Blackwell 做編譯優化。
+
+**解法**:既然 Step 3 已經驗證過 NGC 官方 vLLM 映像
+(`nvcr.io/nvidia/vllm:26.05-py3`)在這台機器上能正常運作,直接**用同一個
+映像再起一個容器**,用 `vllm serve BAAI/bge-m3 --task embed` 模式提供
+OpenAI 相容的 `/v1/embeddings` 端點,完全繞開上述 ARM64 相容性地雷,不用
+再驗證一套新的 Python 環境。BGE-M3 本身只有約 568M 參數(fp16 權重約
+1.1GB),用很小的 `--gpu-memory-utilization`(預設 0.08)即可,不會跟主要
+的 Qwen3-30B-A3B 服務搶記憶體。
+
+見 [`scripts/gx10-rag-setup.sh`](../scripts/gx10-rag-setup.sh)。
+
 ## 相關檔案
 
 - 建置腳本:[`scripts/gx10-vllm-setup.sh`](../scripts/gx10-vllm-setup.sh)
   — 已內建 Step 3 前的驅動版本檢查(對應本文件問題 1)。
+- RAG 基礎設施腳本:[`scripts/gx10-rag-setup.sh`](../scripts/gx10-rag-setup.sh)
+  + [`scripts/rag_smoke_test.py`](../scripts/rag_smoke_test.py)
+  — Qdrant + BGE-M3 embedding + collection 建立/寫入/語意搜尋/持久化驗證
+  (對應本文件問題 4)。
