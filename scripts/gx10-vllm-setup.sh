@@ -62,6 +62,11 @@ CONTAINER_NAME="${CONTAINER_NAME:-vllm-server}"
 HOST_PORT="${HOST_PORT:-8000}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-/home/${TARGET_USER}/.cache/huggingface}"
 HF_TOKEN="${HF_TOKEN:-}"
+# Secrets file sourced when HF_TOKEN isn't already in the environment. Lives
+# OUTSIDE the repo so a token can never be committed. Create it with:
+#   mkdir -p ~/.config/gx10-llm && chmod 700 ~/.config/gx10-llm
+#   printf 'HF_TOKEN=hf_xxx\n' > ~/.config/gx10-llm/env && chmod 600 ~/.config/gx10-llm/env
+HF_ENV_FILE="${HF_ENV_FILE:-/home/${TARGET_USER}/.config/gx10-llm/env}"
 
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-1800}"   # seconds to wait for model load
 POLL_INTERVAL="${POLL_INTERVAL:-5}"          # seconds between log polls
@@ -87,6 +92,37 @@ require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     die "此腳本需要 root/sudo 權限才能安裝套件與設定 Docker。請用: sudo $0"
   fi
+}
+
+# Load HF_TOKEN from HF_ENV_FILE when it isn't already in the environment.
+# The token value is NEVER echoed — only whether one was found, and a
+# masked prefix so you can tell which token is in play.
+load_hf_token() {
+  if [[ -n "${HF_TOKEN}" ]]; then
+    log "HF_TOKEN 由環境變數提供 (${HF_TOKEN:0:5}…,共 ${#HF_TOKEN} 字元)。"
+    return 0
+  fi
+
+  if [[ -f "${HF_ENV_FILE}" ]]; then
+    local perms
+    perms="$(stat -c '%a' "${HF_ENV_FILE}" 2>/dev/null || echo '?')"
+    if [[ "${perms}" != "600" && "${perms}" != "400" ]]; then
+      warn "${HF_ENV_FILE} 的權限是 ${perms},建議收緊為 600: chmod 600 ${HF_ENV_FILE}"
+    fi
+    set -a
+    # shellcheck disable=SC1090
+    source "${HF_ENV_FILE}"
+    set +a
+    HF_TOKEN="${HF_TOKEN:-}"
+    if [[ -n "${HF_TOKEN}" ]]; then
+      log "已從 ${HF_ENV_FILE} 載入 HF_TOKEN (${HF_TOKEN:0:5}…,共 ${#HF_TOKEN} 字元)。"
+      return 0
+    fi
+    warn "${HF_ENV_FILE} 存在,但裡面沒有設定 HF_TOKEN。"
+  fi
+
+  warn "未設定 HF_TOKEN(環境變數與 ${HF_ENV_FILE} 都沒有)。下載模型會以未驗證身分請求 HF Hub,可能被限速(見 docs/gx10-known-issues.md #3)。"
+  return 0
 }
 
 # version_ge A B -> true (0) if version A >= version B, using natural
@@ -116,6 +152,7 @@ check_preconditions() {
   fi
 
   log "目標使用者(將加入 docker 群組): ${TARGET_USER}"
+  load_hf_token
   log "前置檢查通過。"
 }
 

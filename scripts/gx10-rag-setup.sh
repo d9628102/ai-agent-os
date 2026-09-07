@@ -56,6 +56,9 @@ EMBED_VECTOR_SIZE="${EMBED_VECTOR_SIZE:-1024}"
 EMBED_GPU_MEM_UTIL="${EMBED_GPU_MEM_UTIL:-0.03}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-/home/${TARGET_USER}/.cache/huggingface}"
 HF_TOKEN="${HF_TOKEN:-}"
+# Secrets file sourced when HF_TOKEN isn't already in the environment. Lives
+# OUTSIDE the repo so a token can never be committed. See gx10-vllm-setup.sh.
+HF_ENV_FILE="${HF_ENV_FILE:-/home/${TARGET_USER}/.config/gx10-llm/env}"
 EMBED_STARTUP_TIMEOUT="${EMBED_STARTUP_TIMEOUT:-600}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
 
@@ -85,6 +88,36 @@ require_root() {
   fi
 }
 
+# Load HF_TOKEN from HF_ENV_FILE when it isn't already in the environment.
+# The token value is NEVER echoed — only a masked prefix and its length.
+load_hf_token() {
+  if [[ -n "${HF_TOKEN}" ]]; then
+    log "HF_TOKEN 由環境變數提供 (${HF_TOKEN:0:5}…,共 ${#HF_TOKEN} 字元)。"
+    return 0
+  fi
+
+  if [[ -f "${HF_ENV_FILE}" ]]; then
+    local perms
+    perms="$(stat -c '%a' "${HF_ENV_FILE}" 2>/dev/null || echo '?')"
+    if [[ "${perms}" != "600" && "${perms}" != "400" ]]; then
+      warn "${HF_ENV_FILE} 的權限是 ${perms},建議收緊為 600: chmod 600 ${HF_ENV_FILE}"
+    fi
+    set -a
+    # shellcheck disable=SC1090
+    source "${HF_ENV_FILE}"
+    set +a
+    HF_TOKEN="${HF_TOKEN:-}"
+    if [[ -n "${HF_TOKEN}" ]]; then
+      log "已從 ${HF_ENV_FILE} 載入 HF_TOKEN (${HF_TOKEN:0:5}…,共 ${#HF_TOKEN} 字元)。"
+      return 0
+    fi
+    warn "${HF_ENV_FILE} 存在,但裡面沒有設定 HF_TOKEN。"
+  fi
+
+  warn "未設定 HF_TOKEN(環境變數與 ${HF_ENV_FILE} 都沒有)。下載模型會以未驗證身分請求 HF Hub,可能被限速(見 docs/gx10-known-issues.md #3)。"
+  return 0
+}
+
 # ============================================================================
 # PRECONDITIONS
 # ============================================================================
@@ -102,6 +135,7 @@ check_preconditions() {
     warn "找不到執行中的 'vllm-server' 容器。本腳本假設 Qwen3-30B-A3B 已經在跑(scripts/gx10-vllm-setup.sh 的輸出),記憶體headroom 檢查會以目前 GPU 實際用量為準,請自行確認前提是否成立。"
   fi
 
+  load_hf_token
   log "前置檢查通過。"
 }
 
