@@ -29,6 +29,11 @@
 #   GPU_MEM_UTIL=0.58 ./gx10-gptoss-setup.sh
 #   ./gx10-gptoss-setup.sh --smoke-only     # re-test an already-running one
 #
+# On failure, check which of the three known modes it was:
+#   cat /var/tmp/gx10-gptoss-last-failure
+# (one of SM121_TRITON_UNSUPPORTED / SM121_MARLIN_NULL_OUTPUT / OOM, or
+# absent if it wasn't one of these three — see FAILURE CLASSIFICATION below)
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,6 +72,34 @@ die()  { echo "[ERROR $(_ts)] $*" >&2; exit 1; }
 step() { echo; echo "==================================================================="; echo "  $*"; echo "==================================================================="; }
 
 trap 'die "腳本在第 $LINENO 行意外中止。請看上面的錯誤輸出。"' ERR
+
+# ============================================================================
+# FAILURE CLASSIFICATION
+# ============================================================================
+# This device has exactly three known ways gpt-oss-120b MXFP4 fails to
+# work (see the header comment). Whoever hits one of them — now or a year
+# from now, on this machine or the next GX10 — should see which one
+# immediately instead of debugging it as a fresh crash. Each known mode
+# gets a fixed tag, printed as a single greppable line and written to
+# FAILURE_MODE_FILE, distinct from each other and from an unclassified
+# failure (which stays untagged rather than being guessed into one of
+# these three).
+#
+#   SM121_TRITON_UNSUPPORTED  — Triton MXFP4 kernel won't compile on sm_121a
+#   SM121_MARLIN_NULL_OUTPUT  — Marlin fallback runs but returns empty content
+#   OOM                       — insufficient GPU memory, at pre-check or at
+#                               runtime (CUDA OOM / vLLM's own "Free memory
+#                               on device" refusal are the same class of
+#                               problem, just caught at different points)
+FAILURE_MODE_FILE="${FAILURE_MODE_FILE:-/var/tmp/gx10-gptoss-last-failure}"
+rm -f "${FAILURE_MODE_FILE}" 2>/dev/null || true
+
+fail_mode() {
+  local tag="$1"; shift
+  echo "${tag}" > "${FAILURE_MODE_FILE}" 2>/dev/null || true
+  echo "[FAILURE_MODE ${tag} $(_ts)] 已知問題分類 — 見 ${FAILURE_MODE_FILE}" >&2
+  die "$@"
+}
 
 # ============================================================================
 # HF_TOKEN (same sanitisation as the other scripts — see known-issues #7)
@@ -147,7 +180,7 @@ resolve_budget() {
   local out
   if ! out="$("${budget_script}" --plan "${GPTOSS_WEIGHTS_GB}" 2>&1)"; then
     echo "${out}" >&2
-    die "記憶體預算不足，無法部署（上面是完整分析）。
+    fail_mode "OOM" "記憶體預算不足，無法部署（上面是完整分析）。
   依 Stage 0 Task 2 的建議順序，先停掉 Qwen3 再重跑：
       docker rm -f vllm-server
       $0"
@@ -253,10 +286,10 @@ wait_for_ready() {
     if echo "${logs}" | grep -Eqi "tile::scatter4|not supported on .target 'sm_121|ptxas error"; then
       warn "偵測到 Triton MXFP4 kernel 在 sm_121 上編譯失敗，相關 log:"
       echo "${logs}" | grep -Ei "tile::scatter4|ptxas|sm_121" | head -20 >&2
-      die "這是 vllm-project/vllm#41477：Triton MXFP4 MoE kernel 用到 '.tile::scatter4' PTX，
+      fail_mode "SM121_TRITON_UNSUPPORTED" "這是 vllm-project/vllm#41477：Triton MXFP4 MoE kernel 用到 '.tile::scatter4' PTX，
   該指令只在 Hopper/SM100 可用，sm_121a（GB10）不支援。該 issue 已被關成 not-planned。
   可嘗試的方向（都有代價，見腳本開頭註解）：
-    - 讓 vLLM 退到 Marlin：會觸發 #37030 的 null content bug（本腳本的煙霧測試會抓到）
+    - 讓 vLLM 退到 Marlin：會觸發 SM121_MARLIN_NULL_OUTPUT（本腳本的煙霧測試會抓到）
     - Emulation backend：可運作但 <=5 tok/s
     - 改用其他模型作為主力推理層"
     fi
@@ -274,7 +307,7 @@ wait_for_ready() {
     if echo "${logs}" | grep -Eqi 'Free memory on device .* is less than desired GPU memory utilization'; then
       warn "記憶體不足，完整 log:"
       echo "${logs}" >&2
-      die "GPU 剩餘記憶體不足。--gpu-memory-utilization 目前為 ${GPU_MEM_UTIL}。
+      fail_mode "OOM" "GPU 剩餘記憶體不足。--gpu-memory-utilization 目前為 ${GPU_MEM_UTIL}。
   先跑 ./scripts/gx10-gpu-budget.sh --plan ${GPTOSS_WEIGHTS_GB} 重新確認，
   或依 Task 2 建議先 docker rm -f vllm-server 釋放空間。"
     fi
@@ -282,7 +315,7 @@ wait_for_ready() {
     if echo "${logs}" | grep -Eqi 'CUDA out of memory|OutOfMemoryError'; then
       warn "OOM，完整 log:"
       echo "${logs}" >&2
-      die "載入過程 OOM。請調低 --gpu-memory-utilization 或 --max-model-len（目前 ${MAX_MODEL_LEN}）。"
+      fail_mode "OOM" "載入過程 OOM。請調低 --gpu-memory-utilization 或 --max-model-len（目前 ${MAX_MODEL_LEN}）。"
     fi
 
     if echo "${logs}" | grep -Eqi 'Traceback \(most recent call last\)|RuntimeError|Error(Code)?: '; then
@@ -387,7 +420,7 @@ print(json.dumps({
   if [[ -z "${content}" && "${tokens}" -gt 0 ]]; then
     warn "HTTP 200、completion_tokens=${tokens}，但內容是空的"
     warn "（content_is_null=${content_null}）。"
-    die "這正是 vllm-project/vllm#37030 的特徵：SM121 沒有原生 FP4 支援，
+    fail_mode "SM121_MARLIN_NULL_OUTPUT" "這正是 vllm-project/vllm#37030 的特徵：SM121 沒有原生 FP4 支援，
   退回針對 SM80 的 Marlin kernel 後產生錯誤 logits，取樣到錯誤的首個 token，
   於是回傳 content: null / reasoning: null。該 issue 仍為 open。
 
