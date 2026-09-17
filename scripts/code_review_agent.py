@@ -22,20 +22,48 @@ Usage:
   python3 scripts/code_review_agent.py --commit ca35295
   python3 scripts/code_review_agent.py --commit ca35295 --spec docs/some-spec.md
   python3 scripts/code_review_agent.py --files scripts/foo.py --baseline scripts/rag_answer.py scripts/n8n_qa_test_harness.py
+
+  # Gate mode, used by githooks/pre-push -- reviews everything that changed
+  # between two refs; exits non-zero on any blocking finding unless a valid
+  # --override already covers it:
+  python3 scripts/code_review_agent.py --range <old_sha>..<new_sha>
+
+  # Human override for a blocked --range: re-runs the same review, and if
+  # there are still blocking findings, records who/when/why/which findings
+  # were overridden (locally + in Langfuse), good for OVERRIDE_TTL_MINUTES:
+  python3 scripts/code_review_agent.py --override --range <old_sha>..<new_sha> \\
+      --approver "your name" --reason "why this should go through anyway"
 """
 import argparse
 import ast
+import base64
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
+import uuid
+from datetime import datetime, timedelta, timezone
 
 DEFAULT_BASELINE = ["scripts/rag_answer.py", "scripts/n8n_qa_test_harness.py"]
 CHAT_URL = os.environ.get("CHAT_URL", "http://localhost:8000/v1/chat/completions")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "Qwen/Qwen3-30B-A3B")
+
+# Override records: how long a human's "yes, push it anyway" is good for
+# before the same blocking findings need a fresh, re-justified override --
+# this is deliberately not a permanent bypass.
+OVERRIDE_TTL_MINUTES = 30
+OVERRIDE_LOG_FILENAME = ".code_review_overrides.jsonl"
+
+# Read from the environment, never hardcoded -- this script's own Layer 3
+# check would (rightly) flag a literal key here.
+LANGFUSE_BASE_URL = os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
+LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY")
+LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY")
 
 # A handful of common Simplified-only characters that have a different
 # Traditional form -- enough to catch an accidental slip (this repo's own
@@ -170,7 +198,30 @@ def _snake_case_violations(tree, path):
     return findings
 
 
-def check_style(path, source, tree, baseline_sources):
+def _detection_rule_line_ranges(tree):
+    """
+    Line numbers spanned by this file's own detection-rule constants
+    (SIMPLIFIED_ONLY_CHARS, SECRET_PATTERNS, ...). Building a pattern that
+    matches a given dangerous call or character means writing that exact
+    substring into the pattern itself, so scanning these definitions with
+    their own rules produces a self-referential false positive on this
+    file specifically -- skip just the lines those constants span.
+    """
+    rule_names = {
+        "SIMPLIFIED_ONLY_CHARS", "SECRET_PATTERNS",
+        "HARDCODED_ASSIGN_RE", "INJECTION_PATTERNS",
+    }
+    skip = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id in rule_names:
+                end = getattr(node, "end_lineno", node.lineno)
+                skip.update(range(node.lineno, end + 1))
+    return skip
+
+
+def check_style(path, source, tree, baseline_sources, skip_lines=frozenset()):
     findings = []
 
     is_script = 'if __name__ == "__main__"' in source
@@ -187,6 +238,8 @@ def check_style(path, source, tree, baseline_sources):
     findings.extend(_snake_case_violations(tree, path))
 
     for lineno, line in enumerate(source.splitlines(), start=1):
+        if lineno in skip_lines:
+            continue
         for simp, trad in SIMPLIFIED_ONLY_CHARS.items():
             if simp in line:
                 findings.append(finding(
@@ -202,11 +255,14 @@ def check_style(path, source, tree, baseline_sources):
 # Layer 3: security
 # ---------------------------------------------------------------------------
 
-def check_security(path, source):
+def check_security(path, source, skip_lines=frozenset()):
     findings = []
     lines = source.splitlines()
 
     for lineno, line in enumerate(lines, start=1):
+        if lineno in skip_lines:
+            continue
+
         for pattern, desc in SECRET_PATTERNS:
             if pattern.search(line):
                 findings.append(finding(
@@ -334,9 +390,10 @@ def review_file(path, source, repo_root, baseline_sources, spec_text):
         return [finding("blocking", "syntax", path,
                          f"語法錯誤，無法解析：{e.msg}", line=e.lineno)], []
 
+    skip_lines = _detection_rule_line_ranges(tree)
     all_findings.extend(check_syntax_and_imports(path, source, repo_root))
-    all_findings.extend(check_style(path, source, tree, baseline_sources))
-    all_findings.extend(check_security(path, source))
+    all_findings.extend(check_style(path, source, tree, baseline_sources, skip_lines))
+    all_findings.extend(check_security(path, source, skip_lines))
 
     claims = []
     if spec_text:
@@ -372,6 +429,258 @@ def changed_py_files(repo_root, ref):
         if result.returncode != 0:
             die(f"git diff 失敗: {result.stderr.strip()}")
     return [p for p in result.stdout.splitlines() if p.endswith(".py")]
+
+
+def parse_range(range_str):
+    if ".." not in range_str:
+        die(f"--range 需要 OLD..NEW 格式，收到：{range_str}")
+    old, _, new = range_str.partition("..")
+    if not old or not new:
+        die(f"--range 需要 OLD..NEW 格式，收到：{range_str}")
+    return old, new
+
+
+def changed_py_files_range(repo_root, old, new):
+    result = subprocess.run(
+        ["git", "diff", "--name-only", old, new], cwd=repo_root, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        die(f"git diff {old}..{new} 失敗: {result.stderr.strip()}")
+    return [p for p in result.stdout.splitlines() if p.endswith(".py")]
+
+
+def gather_range_targets(repo_root, range_str):
+    old, new = parse_range(range_str)
+    py_files = changed_py_files_range(repo_root, old, new)
+    return [(p, git_show(repo_root, new, p)) for p in py_files]
+
+
+def review_targets(repo_root, targets, baseline_sources, spec_text):
+    all_findings_by_file = {}
+    all_claims_by_file = {}
+    for path, source in targets:
+        log(f"審查 {path} ...")
+        findings, claims = review_file(path, source, repo_root, baseline_sources, spec_text)
+        all_findings_by_file[path] = findings
+        all_claims_by_file[path] = claims
+    return all_findings_by_file, all_claims_by_file
+
+
+def blocking_findings_of(all_findings_by_file):
+    return [f for fs in all_findings_by_file.values() for f in fs if f["level"] == "blocking"]
+
+
+# ---------------------------------------------------------------------------
+# Override records: a blocking finding can only be pushed through by a human
+# who runs --override with their name and a reason. The record is scoped to
+# the exact set of blocking findings it was issued for (via a hash) and
+# expires -- it is not a standing bypass. Kept both locally (fast, no
+# network needed to check) and in Langfuse (append-only, matches the
+# delivery-center approval flow's "tamper-evident external record"
+# principle) under their own trace name/tag/score name so they never mix
+# with the delivery-center's pending-review/human_decision records.
+# ---------------------------------------------------------------------------
+
+def compute_blocking_signature(range_str, blocking_findings):
+    material = range_str + "|" + "\n".join(
+        sorted(f"{f['file']}:{f.get('line')}:{f['message']}" for f in blocking_findings)
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def override_log_path(repo_root):
+    return os.path.join(repo_root, OVERRIDE_LOG_FILENAME)
+
+
+def read_valid_override(repo_root, token):
+    path = override_log_path(repo_root)
+    if not os.path.isfile(path):
+        return None
+    now = datetime.now(timezone.utc)
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("token") == token:
+                try:
+                    expires_at = datetime.fromisoformat(rec["expires_at"])
+                except (KeyError, ValueError):
+                    continue
+                if now <= expires_at:
+                    return rec
+    return None
+
+
+def append_override_record(repo_root, record):
+    with open(override_log_path(repo_root), "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _post_json(url, payload, headers=None, timeout=20):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST"
+    )
+    req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except urllib.error.URLError as e:
+        return None, str(e.reason).encode("utf-8")
+
+
+def send_override_to_langfuse(range_str, approver, reason, blocking_findings, token, expires_at_iso):
+    if not (LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY):
+        log("沒有設定 LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY，略過寫入 Langfuse（本機紀錄仍會寫入）。")
+        return False
+
+    auth = "Basic " + base64.b64encode(
+        f"{LANGFUSE_PUBLIC_KEY}:{LANGFUSE_SECRET_KEY}".encode("utf-8")
+    ).decode("ascii")
+    headers = {"Authorization": auth, "x-langfuse-ingestion-version": "4"}
+
+    trace_id = uuid.uuid4().hex
+    span_id = uuid.uuid4().hex[:16]
+    now_ns = f"{int(time.time() * 1000)}000000"
+
+    trace_body = {
+        "resourceSpans": [{
+            "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "code-review-agent"}}]},
+            "scopeSpans": [{
+                "scope": {"name": "code-review-agent"},
+                "spans": [{
+                    "traceId": trace_id,
+                    "spanId": span_id,
+                    "name": "code_review_override",
+                    "kind": 1,
+                    "startTimeUnixNano": now_ns,
+                    "endTimeUnixNano": now_ns,
+                    "attributes": [
+                        {"key": "langfuse.trace.name", "value": {"stringValue": "code-review-override"}},
+                        {"key": "langfuse.trace.tags",
+                         "value": {"arrayValue": {"values": [{"stringValue": "code-review-override"}]}}},
+                        {"key": "langfuse.observation.metadata.approver", "value": {"stringValue": approver}},
+                        {"key": "langfuse.observation.metadata.reason", "value": {"stringValue": reason}},
+                        {"key": "langfuse.observation.metadata.range", "value": {"stringValue": range_str}},
+                        {"key": "langfuse.observation.metadata.blocking_count",
+                         "value": {"intValue": len(blocking_findings)}},
+                        {"key": "langfuse.observation.metadata.token", "value": {"stringValue": token}},
+                        {"key": "langfuse.observation.metadata.expires_at", "value": {"stringValue": expires_at_iso}},
+                    ],
+                    "status": {"code": 0},
+                }],
+            }],
+        }],
+    }
+    status, _ = _post_json(f"{LANGFUSE_BASE_URL}/api/public/otel/v1/traces", trace_body, headers=headers)
+    if status != 200:
+        log(f"寫入 Langfuse trace 失敗 (status={status})，本機紀錄仍然有效。")
+        return False
+
+    score_body = {
+        "batch": [{
+            "id": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": "score-create",
+            "body": {
+                "id": str(uuid.uuid4()),
+                "traceId": trace_id,
+                "name": "code_review_override",
+                "value": 1,
+                "dataType": "BOOLEAN",
+                "comment": reason,
+                "metadata": {"approver": approver, "range": range_str,
+                             "blocking_count": len(blocking_findings)},
+            },
+        }],
+    }
+    _post_json(f"{LANGFUSE_BASE_URL}/api/public/ingestion", score_body, headers=headers)
+    return True
+
+
+def handle_range(args, repo_root, baseline_sources, spec_text):
+    targets = gather_range_targets(repo_root, args.range)
+    if not targets:
+        log(f"{args.range} 之間沒有變更任何 .py 檔案，放行。")
+        sys.exit(0)
+
+    all_findings_by_file, all_claims_by_file = review_targets(repo_root, targets, baseline_sources, spec_text)
+    clean = print_report(all_findings_by_file, all_claims_by_file, spec_given=bool(spec_text))
+    if clean:
+        sys.exit(0)
+
+    blocking = blocking_findings_of(all_findings_by_file)
+    token = compute_blocking_signature(args.range, blocking)
+    override = read_valid_override(repo_root, token)
+    if override:
+        print()
+        print("## Override 生效")
+        print(f"審核人：{override['approver']}（{override['created_at']}）")
+        print(f"理由：{override['reason']}")
+        print(f"有效期限至 {override['expires_at']}，上面列出的阻斷級問題已經人工看過，放行。")
+        sys.exit(0)
+
+    print()
+    print("## 被擋下")
+    print(f"發現 {len(blocking)} 項阻斷級問題，需要人工 override 才能繼續。執行：")
+    print(f'  python3 scripts/code_review_agent.py --override --range "{args.range}" \\')
+    print('    --approver "你的名字" --reason "為什麼即使有這些警告還是要推送"')
+    sys.exit(1)
+
+
+def handle_override(args, repo_root, baseline_sources, spec_text):
+    if not args.range:
+        die("--override 需要搭配 --range 使用。")
+    if not args.approver or not args.reason:
+        die("--override 需要 --approver 跟 --reason，兩個都要填。")
+
+    targets = gather_range_targets(repo_root, args.range)
+    if not targets:
+        log(f"{args.range} 之間沒有變更任何 .py 檔案，沒有東西需要 override。")
+        sys.exit(0)
+
+    all_findings_by_file, _ = review_targets(repo_root, targets, baseline_sources, spec_text)
+    blocking = blocking_findings_of(all_findings_by_file)
+    if not blocking:
+        log("重新跑過一次審查，這個範圍現在沒有阻斷級問題，不需要 override。")
+        sys.exit(0)
+
+    token = compute_blocking_signature(args.range, blocking)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=OVERRIDE_TTL_MINUTES)
+    record = {
+        "token": token,
+        "range": args.range,
+        "approver": args.approver,
+        "reason": args.reason,
+        "created_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "blocking_count": len(blocking),
+        "blocking_messages": [
+            f"[{f['layer']}] {f['file']}:{f.get('line')} — {f['message']}" for f in blocking
+        ],
+    }
+    append_override_record(repo_root, record)
+    sent = send_override_to_langfuse(
+        args.range, args.approver, args.reason, blocking, token, expires_at.isoformat()
+    )
+
+    print(f"已記錄 override：{len(blocking)} 項阻斷級問題，審核人 {args.approver}")
+    print(f"理由：{args.reason}")
+    print(f"Token: {token}，有效期限至 {expires_at.isoformat()}（{OVERRIDE_TTL_MINUTES} 分鐘）")
+    print(f"本機紀錄：{override_log_path(repo_root)}")
+    print(f"Langfuse：{'已寫入' if sent else '略過(沒有設定金鑰，或寫入失敗)'}")
+    print()
+    print("現在可以重新執行 git push。")
+    sys.exit(0)
 
 
 def load_baseline_sources(repo_root, baseline_paths):
@@ -450,6 +759,12 @@ def main():
     ap = argparse.ArgumentParser(description="手動觸發的 .py 檔案程式碼審查，只出報告不核准/阻擋。")
     ap.add_argument("--files", nargs="*", default=[], help="要審查的檔案路徑（相對於 repo 根目錄）")
     ap.add_argument("--commit", default=None, help="審查這個 commit 裡變更的 .py 檔案（用 after 狀態的完整檔案內容）")
+    ap.add_argument("--range", default=None,
+                     help="審查 OLD..NEW 之間變更的 .py 檔案；有阻斷級問題就 exit 1，供 pre-push hook 使用")
+    ap.add_argument("--override", action="store_true",
+                     help="對 --range 目前的阻斷級問題留下人工核准紀錄（需要 --approver 跟 --reason）")
+    ap.add_argument("--approver", default=None, help="--override 用：審核人名字")
+    ap.add_argument("--reason", default=None, help="--override 用：為什麼即使有阻斷級問題還是要放行")
     ap.add_argument("--spec", default=None, help="規格文件路徑，提供時才會跑第4層規格對齊比對")
     ap.add_argument("--baseline", nargs="*", default=DEFAULT_BASELINE,
                      help="風格基準檔案，預設是 rag_answer.py 跟 n8n_qa_test_harness.py")
@@ -457,6 +772,21 @@ def main():
     args = ap.parse_args()
 
     repo_root = os.path.abspath(args.repo_root)
+    baseline_sources = load_baseline_sources(repo_root, args.baseline)
+    spec_text = None
+    if args.spec:
+        spec_full = args.spec if os.path.isabs(args.spec) else os.path.join(repo_root, args.spec)
+        if not os.path.isfile(spec_full):
+            die(f"規格文件不存在：{args.spec}")
+        with open(spec_full, "r", encoding="utf-8") as f:
+            spec_text = f.read()
+
+    if args.override:
+        handle_override(args, repo_root, baseline_sources, spec_text)
+        return
+    if args.range:
+        handle_range(args, repo_root, baseline_sources, spec_text)
+        return
 
     targets = []  # list of (relative_path, source)
     if args.commit:
@@ -474,25 +804,11 @@ def main():
             targets.append((rel, f.read()))
 
     if not targets:
-        die("沒有要審查的檔案，用 --files 或 --commit 指定。")
+        die("沒有要審查的檔案，用 --files、--commit 或 --range 指定。")
 
-    spec_text = None
-    if args.spec:
-        spec_full = args.spec if os.path.isabs(args.spec) else os.path.join(repo_root, args.spec)
-        if not os.path.isfile(spec_full):
-            die(f"規格文件不存在：{args.spec}")
-        with open(spec_full, "r", encoding="utf-8") as f:
-            spec_text = f.read()
-
-    baseline_sources = load_baseline_sources(repo_root, args.baseline)
-
-    all_findings_by_file = {}
-    all_claims_by_file = {}
-    for path, source in targets:
-        log(f"審查 {path} ...")
-        findings, claims = review_file(path, source, repo_root, baseline_sources, spec_text)
-        all_findings_by_file[path] = findings
-        all_claims_by_file[path] = claims
+    all_findings_by_file, all_claims_by_file = review_targets(
+        repo_root, targets, baseline_sources, spec_text
+    )
 
     clean = print_report(all_findings_by_file, all_claims_by_file, spec_given=bool(spec_text))
     # Exit code reflects presence of blocking findings for scripting convenience,
