@@ -9,19 +9,25 @@
 #    docstring) -- these are heuristic judgments with room for "yes, this one
 #    is fine".
 #
-# 2. pytest tests/test_detect_think_reason.py -- pinned, previously-verified
-#    behavior for detect_think_reason()/split_think(). THIS ONE HAS NO
-#    OVERRIDE. A failing test here means measured behavior actually changed
-#    from a fact we already validated on real GX10 runs, not a heuristic
-#    that might have a legitimate exception. If the expected behavior really
-#    needs to change, the correct fix is to edit the test's expectation as
-#    part of the same commit (so the diff shows the deliberate change), not
-#    to push past a red test.
+# 2. pytest over TEST_TO_LOGIC's keys below -- pinned, previously-verified
+#    behavior. THIS ONE HAS NO OVERRIDE. A failing test here means measured
+#    behavior actually changed from a fact we already validated on real
+#    GX10 runs, not a heuristic that might have a legitimate exception. If
+#    the expected behavior really needs to change, the correct fix is to
+#    edit the test's expectation as part of the same commit (so the diff
+#    shows the deliberate change), not to push past a red test.
 #
-# Also prints a (non-blocking) reminder if this push touches the test file
-# without touching scripts/rag_answer.py -- that shape is exactly what
-# "quietly loosening a test instead of fixing the logic" looks like, so it's
-# worth a human's eyes even though it isn't blocked outright.
+#    A new test file (from scripts/test_generation_agent.py or written by
+#    hand) only gets this protection once it's added to TEST_TO_LOGIC below
+#    -- that's a deliberate manual step, same principle as "a draft test
+#    file is never trusted until a human reviews every assertion" carrying
+#    through to "a reviewed file doesn't enforce anything until it's wired
+#    in here on purpose".
+#
+# Also prints a (non-blocking) reminder if a push touches one of these test
+# files without touching the .py file it's meant to test -- that shape is
+# exactly what "quietly loosening a test instead of fixing the logic" looks
+# like, so it's worth a human's eyes even though it isn't blocked outright.
 #
 # Known limitation: like any client-side git hook, this is skipped entirely
 # by `git push --no-verify`. Closing that gap needs server-side enforcement
@@ -33,7 +39,14 @@ zero="0000000000000000000000000000000000000000"
 blocked=0
 
 test_python="${repo_root}/.venv/bin/python"
-test_file="tests/test_detect_think_reason.py"
+
+# test file -> the .py file it's meant to test (for the test-only-change
+# reminder). Add a new pair here only after a human has approved every
+# assertion in the file -- see scripts/test_generation_agent.py's docstring.
+declare -A TEST_TO_LOGIC=(
+  ["tests/test_detect_think_reason.py"]="scripts/rag_answer.py"
+  ["tests/test_report_helpers.py"]="scripts/generate_report.py"
+)
 
 run_pytest() {
   local range="$1"
@@ -45,8 +58,12 @@ run_pytest() {
          "請先在 repo 根目錄跑 python3 -m venv .venv && .venv/bin/pip install pytest pytest-asyncio" >&2
     return 1
   fi
-  echo "[test-gate] 跑 ${test_file} ..." >&2
-  if ! "${test_python}" -m pytest "${repo_root}/${test_file}" -q; then
+  local test_file full_paths=()
+  for test_file in "${!TEST_TO_LOGIC[@]}"; do
+    full_paths+=("${repo_root}/${test_file}")
+  done
+  echo "[test-gate] 跑 ${!TEST_TO_LOGIC[*]} ..." >&2
+  if ! "${test_python}" -m pytest "${full_paths[@]}" -q; then
     echo "[test-gate] 測試失敗，這個不能 override，請修好邏輯或明確更新測試預期值後再推。" >&2
     return 1
   fi
@@ -57,12 +74,16 @@ warn_test_only_change() {
   local range="$1"
   local changed
   changed="$(git -C "${repo_root}" diff --name-only "${range}")"
-  if echo "${changed}" | grep -q "^${test_file}$" \
-      && ! echo "${changed}" | grep -q "^scripts/rag_answer\.py$"; then
-    echo "[test-gate] 提醒：這次改了 ${test_file} 但沒有改 scripts/rag_answer.py。" \
-         "如果是故意調整預期行為，麻煩在 commit message 裡講清楚為什麼；" \
-         "如果不是故意的，這個形狀（只鬆動測試、沒改邏輯）正是規避測試的樣子，先確認一下。" >&2
-  fi
+  local test_file logic_file
+  for test_file in "${!TEST_TO_LOGIC[@]}"; do
+    logic_file="${TEST_TO_LOGIC[$test_file]}"
+    if echo "${changed}" | grep -q "^${test_file}$" \
+        && ! echo "${changed}" | grep -q "^${logic_file}$"; then
+      echo "[test-gate] 提醒：這次改了 ${test_file} 但沒有改 ${logic_file}。" \
+           "如果是故意調整預期行為，麻煩在 commit message 裡講清楚為什麼；" \
+           "如果不是故意的，這個形狀（只鬆動測試、沒改邏輯）正是規避測試的樣子，先確認一下。" >&2
+    fi
+  done
 }
 
 while read -r local_ref local_sha remote_ref remote_sha; do

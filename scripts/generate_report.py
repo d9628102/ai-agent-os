@@ -163,6 +163,12 @@ def slugify_heading(text: str) -> str:
     return re.sub(r"\s+", "-", text.strip())
 
 
+def filter_citations(hits, min_score: float = MIN_CITATION_SCORE):
+    """只留下真的有支撐力的檢索結果。負向對照題常見的情況是 top-k 裡沒有一個
+    真正相關的片段,只是矬中選優——全部濾掉比硬列低分來源湊數更誠實。"""
+    return [h for h in hits if h.get("score", 0.0) >= min_score]
+
+
 def render_section(index: int, result: dict, qa: dict) -> str:
     lines = []
     lines.append(f"## {heading_text(index, result['question'])}")
@@ -190,7 +196,7 @@ def render_section(index: int, result: dict, qa: dict) -> str:
     lines.append("")
 
     lines.append("**參考來源**（依檢索相關度排序）：")
-    cited_hits = [h for h in result["hits"] if h.get("score", 0.0) >= MIN_CITATION_SCORE]
+    cited_hits = filter_citations(result["hits"])
     if cited_hits:
         for hit in cited_hits:
             payload = hit.get("payload", {})
