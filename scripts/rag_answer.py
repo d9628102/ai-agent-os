@@ -252,6 +252,15 @@ def answer_one(question, collection, top_k, max_tokens, temperature,
         "top_heading": hits[0].get("payload", {}).get("heading_path", "?"),
         "total": total,
         "gen": t_gen,
+        # Everything below was already computed above; exposing it lets a
+        # caller (e.g. generate_report.py) reuse this one orchestration path
+        # instead of re-implementing retrieve+generate itself. Existing
+        # callers are unaffected -- these are additions, not replacements.
+        "hits": hits,
+        "context": context,
+        "completion_tokens": usage.get("completion_tokens"),
+        "think_used": enable_thinking,
+        "thinking": thinking,
     }
 
 

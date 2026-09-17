@@ -25,3 +25,6 @@ Thumbs.db
 
 # Local override records for scripts/code_review_agent.py (durable copy in Langfuse)
 .code_review_overrides.jsonl
+
+# generate_report.py output
+reports/
