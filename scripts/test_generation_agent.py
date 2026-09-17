@@ -12,7 +12,7 @@ test_generation_agent.py
 絕對不讓它自己核准/收錄」——這裡的人工核准點更早,在測試案例被信任、進
 版控之前就要經過人看,不是等測試失敗才靠 override。
 
-用法:
+Usage:
   python3 scripts/test_generation_agent.py \\
       --target scripts/generate_report.py:slugify_heading \\
       --target scripts/generate_report.py:filter_citations \\

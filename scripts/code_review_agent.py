@@ -137,6 +137,69 @@ def _requirements_packages(repo_root):
     return names
 
 
+def _is_os_path_attr(node, attr):
+    """Matches the `os.path.<attr>` attribute chain."""
+    return (isinstance(node, ast.Attribute) and node.attr == attr
+            and isinstance(node.value, ast.Attribute) and node.value.attr == "path"
+            and isinstance(node.value.value, ast.Name) and node.value.value.id == "os")
+
+
+def _eval_path_expr(node, file_dir):
+    """
+    Evaluates just enough of an os.path.{join,dirname,abspath} expression
+    tree to resolve this repo's own sys.path.insert/append idioms (e.g.
+    `os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")`)
+    to a real directory, relative to file_dir (the directory of the file
+    being reviewed). Returns None for anything else -- this is deliberately
+    narrow, not a general expression evaluator.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if _is_os_path_attr(node.func, "join") and node.args:
+            parts = [_eval_path_expr(a, file_dir) for a in node.args]
+            if all(p is not None for p in parts):
+                return os.path.join(*parts)
+            return None
+        if _is_os_path_attr(node.func, "dirname") and node.args:
+            inner = _eval_path_expr(node.args[0], file_dir)
+            return os.path.dirname(inner) if inner is not None else None
+        if _is_os_path_attr(node.func, "abspath") and node.args:
+            arg = node.args[0]
+            if isinstance(arg, ast.Name) and arg.id == "__file__":
+                # A stand-in path inside file_dir -- callers only ever take
+                # dirname() of this, so the fake basename never surfaces.
+                return os.path.join(file_dir, "__file__")
+            return _eval_path_expr(arg, file_dir)
+    return None
+
+
+def _sys_path_extra_dirs(tree, file_dir):
+    """
+    Directories a file adds to sys.path at runtime via sys.path.insert/
+    append -- e.g. tests/test_report_helpers.py adds scripts/ this way to
+    import generate_report. Without this, the import-declared check has no
+    way to know that import is local, and flags it as an undeclared
+    dependency every time.
+    """
+    extra_dirs = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr not in ("insert", "append"):
+            continue
+        obj = node.func.value
+        if not (isinstance(obj, ast.Attribute) and obj.attr == "path"
+                and isinstance(obj.value, ast.Name) and obj.value.id == "sys"):
+            continue
+        if not node.args:
+            continue
+        resolved = _eval_path_expr(node.args[-1], file_dir)
+        if resolved:
+            extra_dirs.append(os.path.normpath(resolved))
+    return extra_dirs
+
+
 def check_syntax_and_imports(path, source, repo_root):
     findings = []
     try:
@@ -149,6 +212,7 @@ def check_syntax_and_imports(path, source, repo_root):
     stdlib = _stdlib_modules()
     declared = _requirements_packages(repo_root)
     local_dir = os.path.dirname(os.path.join(repo_root, path))
+    search_dirs = [local_dir] + _sys_path_extra_dirs(tree, local_dir)
 
     for node in ast.walk(tree):
         modules = []
@@ -164,7 +228,7 @@ def check_syntax_and_imports(path, source, repo_root):
                 continue
             if mod.lower().replace("-", "_") in declared:
                 continue
-            if os.path.isfile(os.path.join(local_dir, f"{mod}.py")):
+            if any(os.path.isfile(os.path.join(d, f"{mod}.py")) for d in search_dirs):
                 continue
             findings.append(finding(
                 "suggestion", "syntax", path,
@@ -263,21 +327,28 @@ def check_security(path, source, skip_lines=frozenset()):
         if lineno in skip_lines:
             continue
 
+        # 一行同時符合「像密鑰的格式」跟「變數名+字面字串指派」時只報一次
+        # ——兩條規則本來就常常一起命中同一個硬寫密鑰，之前會各報一次，
+        # 讓報告看起來像兩個問題,其實是同一行同一件事。
+        secret_matched = False
         for pattern, desc in SECRET_PATTERNS:
             if pattern.search(line):
                 findings.append(finding(
                     "blocking", "security", path,
                     f"{desc}，看起來是硬寫在程式碼裡的密鑰/憑證", line=lineno,
                 ))
+                secret_matched = True
+                break
 
-        m = HARDCODED_ASSIGN_RE.search(line)
-        if m:
-            var, value = m.group(1), m.group(2)
-            findings.append(finding(
-                "blocking", "security", path,
-                f"變數 '{var}' 直接指派了字面字串值 '{value[:6]}...'，"
-                f"憑證/密鑰不該寫死在程式碼裡，應該讀環境變數", line=lineno,
-            ))
+        if not secret_matched:
+            m = HARDCODED_ASSIGN_RE.search(line)
+            if m:
+                var, value = m.group(1), m.group(2)
+                findings.append(finding(
+                    "blocking", "security", path,
+                    f"變數 '{var}' 直接指派了字面字串值 '{value[:6]}...'，"
+                    f"憑證/密鑰不該寫死在程式碼裡，應該讀環境變數", line=lineno,
+                ))
 
         for pattern, desc in INJECTION_PATTERNS:
             if pattern.search(line):
@@ -449,10 +520,21 @@ def changed_py_files_range(repo_root, old, new):
     return [p for p in result.stdout.splitlines() if p.endswith(".py")]
 
 
-def gather_range_targets(repo_root, range_str):
+def apply_only_file_filter(targets, only_files):
+    """Restricts targets to the given paths -- e.g. a merge commit range
+    that pulled in unrelated files from the other side of the merge, and
+    the reviewer only wants to look at the ones they actually touched."""
+    if not only_files:
+        return targets
+    only_set = set(only_files)
+    return [(p, s) for p, s in targets if p in only_set]
+
+
+def gather_range_targets(repo_root, range_str, only_files=None):
     old, new = parse_range(range_str)
     py_files = changed_py_files_range(repo_root, old, new)
-    return [(p, git_show(repo_root, new, p)) for p in py_files]
+    targets = [(p, git_show(repo_root, new, p)) for p in py_files]
+    return apply_only_file_filter(targets, only_files)
 
 
 def review_targets(repo_root, targets, baseline_sources, spec_text):
@@ -607,9 +689,12 @@ def send_override_to_langfuse(range_str, approver, reason, blocking_findings, to
 
 
 def handle_range(args, repo_root, baseline_sources, spec_text):
-    targets = gather_range_targets(repo_root, args.range)
+    targets = gather_range_targets(repo_root, args.range, args.only_file)
     if not targets:
-        log(f"{args.range} 之間沒有變更任何 .py 檔案，放行。")
+        if args.only_file:
+            log(f"{args.range} 之間，--only-file 指定的檔案沒有一個有變更，放行。")
+        else:
+            log(f"{args.range} 之間沒有變更任何 .py 檔案，放行。")
         sys.exit(0)
 
     all_findings_by_file, all_claims_by_file = review_targets(repo_root, targets, baseline_sources, spec_text)
@@ -642,7 +727,7 @@ def handle_override(args, repo_root, baseline_sources, spec_text):
     if not args.approver or not args.reason:
         die("--override 需要 --approver 跟 --reason，兩個都要填。")
 
-    targets = gather_range_targets(repo_root, args.range)
+    targets = gather_range_targets(repo_root, args.range, args.only_file)
     if not targets:
         log(f"{args.range} 之間沒有變更任何 .py 檔案，沒有東西需要 override。")
         sys.exit(0)
@@ -765,6 +850,9 @@ def main():
                      help="對 --range 目前的阻斷級問題留下人工核准紀錄（需要 --approver 跟 --reason）")
     ap.add_argument("--approver", default=None, help="--override 用：審核人名字")
     ap.add_argument("--reason", default=None, help="--override 用：為什麼即使有阻斷級問題還是要放行")
+    ap.add_argument("--only-file", action="append", default=None,
+                     help="只審查這些檔案，即使 --commit/--range 的範圍裡改了更多"
+                          "（例如 merge commit 會拉進其他不相關的變更）；可重複指定")
     ap.add_argument("--spec", default=None, help="規格文件路徑，提供時才會跑第4層規格對齊比對")
     ap.add_argument("--baseline", nargs="*", default=DEFAULT_BASELINE,
                      help="風格基準檔案，預設是 rag_answer.py 跟 n8n_qa_test_harness.py")
@@ -793,8 +881,9 @@ def main():
         for p in changed_py_files(repo_root, args.commit):
             source = git_show(repo_root, args.commit, p)
             targets.append((p, source))
+        targets = apply_only_file_filter(targets, args.only_file)
         if not targets:
-            log(f"commit {args.commit} 裡沒有變更任何 .py 檔案。")
+            log(f"commit {args.commit} 裡沒有變更任何 .py 檔案（或都被 --only-file 篩掉了）。")
     for p in args.files:
         full = p if os.path.isabs(p) else os.path.join(repo_root, p)
         if not os.path.isfile(full):
