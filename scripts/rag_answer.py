@@ -16,8 +16,11 @@ Flow per question:
 
 Thinking mode is OFF by default for Phase 1 (speed first: 4.8x faster
 end-to-end, with fact accuracy and the grounding guard both holding in
-testing). Pass --think for questions where disambiguation matters — see
-docs/rag-findings.md for the measured trade-off and its caveats.
+testing). Pass --think to force it on for a whole run, or let
+detect_think_reason() switch it on per-question when the question has a
+comparison word (不同/差異/區別/...) or two or more proper nouns (naming
+confusion risk) — see docs/rag-findings.md Known Issue #7 for the
+measured trade-off and this rule's rationale.
 
 When thinking is on, Qwen3 emits its chain of thought inside
 <think>...</think>. That is stripped from the answer (see split_think for
@@ -60,6 +63,37 @@ SYSTEM_PROMPT = os.environ.get(
 )
 
 THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+# Known Issue #7 的規則式判斷（見 docs/rag-findings.md）。
+COMPARISON_KEYWORDS = ("不同", "差異", "區別", "比較", "差別", "對比", "相比", "相較")
+
+# 抓連續、大寫字母開頭的英文詞當作一個「專有名詞」；緊鄰的詞
+# (例如 "PSF EIM"、"Customer Success") 視為同一個實體一起吃掉，避免
+# 只因為問題裡出現一次產品名縮寫就誤判有命名混淆風險。
+PROPER_NOUN_RE = re.compile(
+    r"[A-Z][A-Za-z0-9]*(?:™|®)?(?:\s+[A-Z][A-Za-z0-9]*(?:™|®)?)*"
+)
+
+
+def detect_think_reason(question: str):
+    """
+    依 Known Issue #7 的兩條規則判斷這一題是否該自動開啟思考模式：
+      1. 問題含比較性詞彙（例如「不同」「差異」「區別」）
+      2. 偵測到兩個以上專有名詞（可能有命名混淆風險）
+      3. 其他一般查詢維持 --no-think
+
+    回傳 (should_think, reason)；reason 為 None 代表不需要自動開啟，
+    否則是給 log 用的人類可讀說明。
+    """
+    hit_keywords = [kw for kw in COMPARISON_KEYWORDS if kw in question]
+    if hit_keywords:
+        return True, f"問題含比較性詞彙「{'、'.join(hit_keywords)}」"
+
+    entities = sorted(set(PROPER_NOUN_RE.findall(question)))
+    if len(entities) >= 2:
+        return True, f"偵測到 {len(entities)} 個專有名詞(命名混淆風險): {'、'.join(entities)}"
+
+    return False, None
 
 
 def split_think(text: str):
@@ -221,11 +255,13 @@ def main():
     ap.add_argument("--show-think", action="store_true", help="顯示 <think> 推理內容")
     ap.add_argument("--show-context", action="store_true", help="顯示送進模型的完整片段")
     ap.add_argument("--think", action="store_true",
-                    help="開啟 Qwen3 的思考模式。Phase 1 預設為關閉(速度優先)："
-                         "GX10 實測關閉後平均端到端 18.63s -> 3.87s(4.8 倍)，因為約 81%% "
-                         "的輸出是使用者看不到的推理內容，且事實正確性與防幻覺未退步。"
-                         "但關閉後對「命名易混淆」或「需完整列舉」的問題可能遺漏辨析細節，"
-                         "這類問題建議加上本開關 —— 取捨細節與待補測見 docs/rag-findings.md")
+                    help="強制開啟 Qwen3 的思考模式(對這次執行的所有問題生效)。"
+                         "Phase 1 預設為關閉(速度優先)：GX10 實測關閉後平均端到端 "
+                         "18.63s -> 3.87s(4.8 倍)，且事實正確性與防幻覺未退步。"
+                         "但關閉後對「命名易混淆」或「需完整列舉」的問題可能遺漏辨析細節。"
+                         "即使不加這個旗標，含比較性詞彙或偵測到兩個以上專有名詞的問題也會"
+                         "自動逐題切換為思考模式(見 detect_think_reason / "
+                         "docs/rag-findings.md Known Issue #7)")
     args = ap.parse_args()
 
     questions = list(args.questions)
@@ -239,15 +275,20 @@ def main():
         die("請至少提供一個問題(位置參數)或用 --queries-file 指定檔案。")
 
     ensure_collection(args.collection, create=False)
-    log(f"檢索 top_k={args.top_k}，生成模型 {CHAT_MODEL} @ {CHAT_URL}"
-        f"，思考模式 {'開啟' if args.think else '關閉(Phase 1 預設，速度優先)'}")
+    base_mode = "開啟(手動 --think，套用到全部問題)" if args.think \
+        else "關閉(Phase 1 預設，逐題可能依規則自動切換，見 Known Issue #7)"
+    log(f"檢索 top_k={args.top_k}，生成模型 {CHAT_MODEL} @ {CHAT_URL}，思考模式 {base_mode}")
 
-    results = [
-        answer_one(q, args.collection, args.top_k, args.max_tokens,
-                   args.temperature, args.show_think, args.show_context,
-                   enable_thinking=args.think)
-        for q in questions
-    ]
+    results = []
+    for q in questions:
+        auto_think, think_reason = detect_think_reason(q)
+        if not args.think and auto_think:
+            log(f"「{q}」{think_reason} → 本題自動切換為 --think")
+        results.append(
+            answer_one(q, args.collection, args.top_k, args.max_tokens,
+                       args.temperature, args.show_think, args.show_context,
+                       enable_thinking=args.think or auto_think)
+        )
 
     print(f"\n\n{'=' * 72}")
     print("彙總")
