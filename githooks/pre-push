@@ -1,11 +1,27 @@
 #!/usr/bin/env bash
 # Installed via `git config core.hooksPath githooks` (see scripts/install_hooks.sh).
 #
-# Blocks a push when scripts/code_review_agent.py finds a blocking-level
-# issue in the .py files being pushed, unless a human already ran
-# `code_review_agent.py --override` for that exact set of findings (see the
-# script's own docstring). This hook only decides "run the agent, respect
-# its exit code" -- it never overrides anything itself.
+# Two independent checks per push, both able to block it:
+#
+# 1. scripts/code_review_agent.py --range -- blocking-level findings (syntax,
+#    hardcoded secrets, injection risk, spec misalignment). A human can push
+#    through anyway via `code_review_agent.py --override` (see that script's
+#    docstring) -- these are heuristic judgments with room for "yes, this one
+#    is fine".
+#
+# 2. pytest tests/test_detect_think_reason.py -- pinned, previously-verified
+#    behavior for detect_think_reason()/split_think(). THIS ONE HAS NO
+#    OVERRIDE. A failing test here means measured behavior actually changed
+#    from a fact we already validated on real GX10 runs, not a heuristic
+#    that might have a legitimate exception. If the expected behavior really
+#    needs to change, the correct fix is to edit the test's expectation as
+#    part of the same commit (so the diff shows the deliberate change), not
+#    to push past a red test.
+#
+# Also prints a (non-blocking) reminder if this push touches the test file
+# without touching scripts/rag_answer.py -- that shape is exactly what
+# "quietly loosening a test instead of fixing the logic" looks like, so it's
+# worth a human's eyes even though it isn't blocked outright.
 #
 # Known limitation: like any client-side git hook, this is skipped entirely
 # by `git push --no-verify`. Closing that gap needs server-side enforcement
@@ -15,6 +31,39 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 zero="0000000000000000000000000000000000000000"
 blocked=0
+
+test_python="${repo_root}/.venv/bin/python"
+test_file="tests/test_detect_think_reason.py"
+
+run_pytest() {
+  local range="$1"
+  if ! git -C "${repo_root}" diff --name-only "${range}" | grep -q '\.py$'; then
+    return 0  # nothing .py changed in this range, nothing to test
+  fi
+  if [ ! -x "${test_python}" ]; then
+    echo "[test-gate] 找不到 ${test_python}，這個檢查沒有 override，" \
+         "請先在 repo 根目錄跑 python3 -m venv .venv && .venv/bin/pip install pytest pytest-asyncio" >&2
+    return 1
+  fi
+  echo "[test-gate] 跑 ${test_file} ..." >&2
+  if ! "${test_python}" -m pytest "${repo_root}/${test_file}" -q; then
+    echo "[test-gate] 測試失敗，這個不能 override，請修好邏輯或明確更新測試預期值後再推。" >&2
+    return 1
+  fi
+  return 0
+}
+
+warn_test_only_change() {
+  local range="$1"
+  local changed
+  changed="$(git -C "${repo_root}" diff --name-only "${range}")"
+  if echo "${changed}" | grep -q "^${test_file}$" \
+      && ! echo "${changed}" | grep -q "^scripts/rag_answer\.py$"; then
+    echo "[test-gate] 提醒：這次改了 ${test_file} 但沒有改 scripts/rag_answer.py。" \
+         "如果是故意調整預期行為，麻煩在 commit message 裡講清楚為什麼；" \
+         "如果不是故意的，這個形狀（只鬆動測試、沒改邏輯）正是規避測試的樣子，先確認一下。" >&2
+  fi
+}
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   if [ "$local_sha" = "$zero" ]; then
@@ -27,10 +76,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   fi
 
   range="${remote_sha}..${local_sha}"
+
   echo "[code-review-gate] 審查 ${range} 裡的 .py 變更..." >&2
   if ! python3 "${repo_root}/scripts/code_review_agent.py" --range "${range}"; then
     blocked=1
   fi
+
+  if ! run_pytest "${range}"; then
+    blocked=1
+  fi
+
+  warn_test_only_change "${range}"
 done
 
 if [ "${blocked}" -ne 0 ]; then
