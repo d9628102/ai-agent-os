@@ -14,13 +14,18 @@ Flow per question:
   5. Strip Qwen3's <think> reasoning from what's shown, and report
      per-stage plus end-to-end timing
 
-Thinking mode is OFF by default for Phase 1 (speed first: 4.8x faster
-end-to-end, with fact accuracy and the grounding guard both holding in
-testing). Pass --think to force it on for a whole run, or let
-detect_think_reason() switch it on per-question when the question has a
+Thinking mode defaults to ON (DEFAULT_THINKING below). Repeated A/B
+testing showed that without it, questions the document can't actually
+support get a manufactured answer instead of "文件中未提及" — 3/3 of runs,
+against 0/3 with thinking on. It costs roughly 4x in latency. See
+docs/rag-findings.md Known Issue #7 for that experiment.
+
+Pass --think or --no-think to decide for a whole run explicitly. Leave
+both off and detect_think_reason() decides per question instead: a
 comparison word (不同/差異/區別/...) or two or more proper nouns (naming
-confusion risk) — see docs/rag-findings.md Known Issue #7 for the
-measured trade-off and this rule's rationale.
+confusion risk) forces thinking on regardless of DEFAULT_THINKING;
+anything else falls back to DEFAULT_THINKING. An explicit --think/
+--no-think always wins over the detector.
 
 When thinking is on, Qwen3 emits its chain of thought inside
 <think>...</think>. That is stripped from the answer (see split_think for
@@ -49,6 +54,14 @@ from rag_common import (  # noqa: E402
 
 CHAT_URL = os.environ.get("CHAT_URL", "http://localhost:8000/v1/chat/completions")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "Qwen/Qwen3-30B-A3B")
+
+# Whether Qwen3 reasons before answering when neither --think nor
+# --no-think is given. This policy has changed more than once, so it lives
+# in one named place and BOTH flags always exist — changing the default
+# must never break a command someone already uses.
+# Currently True: grounding on document-unsupported questions outweighs the
+# ~4x latency (docs/rag-findings.md Known Issue #7).
+DEFAULT_THINKING = True
 
 SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
@@ -141,7 +154,7 @@ def build_context(hits):
 
 
 def generate(question: str, context: str, max_tokens: int, temperature: float,
-             enable_thinking: bool = False):
+             enable_thinking: bool = DEFAULT_THINKING):
     user_content = (
         f"以下是從內部文件中檢索到的片段：\n\n{context}\n\n"
         f"---\n\n請根據上方文件片段回答這個問題：{question}"
@@ -177,7 +190,7 @@ def generate(question: str, context: str, max_tokens: int, temperature: float,
 
 
 def answer_one(question, collection, top_k, max_tokens, temperature,
-               show_think, show_context, enable_thinking=False):
+               show_think, show_context, enable_thinking=DEFAULT_THINKING):
     print(f"\n{'=' * 72}")
     print(f"Q: {question}")
     print("=" * 72)
@@ -254,14 +267,20 @@ def main():
                     help="低溫度較適合有依據的問答 (預設 0.2)")
     ap.add_argument("--show-think", action="store_true", help="顯示 <think> 推理內容")
     ap.add_argument("--show-context", action="store_true", help="顯示送進模型的完整片段")
-    ap.add_argument("--think", action="store_true",
-                    help="強制開啟 Qwen3 的思考模式(對這次執行的所有問題生效)。"
-                         "Phase 1 預設為關閉(速度優先)：GX10 實測關閉後平均端到端 "
-                         "18.63s -> 3.87s(4.8 倍)，且事實正確性與防幻覺未退步。"
-                         "但關閉後對「命名易混淆」或「需完整列舉」的問題可能遺漏辨析細節。"
-                         "即使不加這個旗標，含比較性詞彙或偵測到兩個以上專有名詞的問題也會"
-                         "自動逐題切換為思考模式(見 detect_think_reason / "
-                         "docs/rag-findings.md Known Issue #7)")
+    think_group = ap.add_mutually_exclusive_group()
+    think_group.add_argument(
+        "--think", dest="think", action="store_true", default=None,
+        help=f"明確開啟 Qwen3 的思考模式,對這次執行的所有問題生效,"
+             f"detect_think_reason() 不會覆寫(目前預設"
+             f"{'開啟' if DEFAULT_THINKING else '關閉'})")
+    think_group.add_argument(
+        "--no-think", dest="think", action="store_false", default=None,
+        help="明確關閉思考模式，換取約 4 倍速度，對這次執行的所有問題生效，"
+             "detect_think_reason() 不會覆寫。代價：文件無法支撐的問題"
+             "(例如「跟 X 有什麼不同」但文件從未描述 X)會被硬湊出答案而非"
+             "回答「文件中未提及」，實測 3/3 發生 —— 見 docs/rag-findings.md。"
+             "不確定該不該關的話，不要加這個旗標，讓 detect_think_reason() "
+             "在偵測到比較句或命名混淆風險時自動開啟")
     args = ap.parse_args()
 
     questions = list(args.questions)
@@ -274,20 +293,27 @@ def main():
     if not questions:
         die("請至少提供一個問題(位置參數)或用 --queries-file 指定檔案。")
 
+    enable_thinking = DEFAULT_THINKING if args.think is None else args.think
+    source = "預設" if args.think is None else "指定"
+
     ensure_collection(args.collection, create=False)
-    base_mode = "開啟(手動 --think，套用到全部問題)" if args.think \
-        else "關閉(Phase 1 預設，逐題可能依規則自動切換，見 Known Issue #7)"
-    log(f"檢索 top_k={args.top_k}，生成模型 {CHAT_MODEL} @ {CHAT_URL}，思考模式 {base_mode}")
+    detector_note = "，逐題可能依規則自動切換為開啟，見 Known Issue #7" if args.think is None else ""
+    log(f"檢索 top_k={args.top_k}，生成模型 {CHAT_MODEL} @ {CHAT_URL}"
+        f"，思考模式 {'開啟' if enable_thinking else '關閉'}({source}{detector_note})")
 
     results = []
     for q in questions:
-        auto_think, think_reason = detect_think_reason(q)
-        if not args.think and auto_think:
+        if args.think is None:
+            auto_think, think_reason = detect_think_reason(q)
+        else:
+            auto_think, think_reason = False, None
+        effective_thinking = enable_thinking or auto_think
+        if auto_think and not enable_thinking:
             log(f"「{q}」{think_reason} → 本題自動切換為 --think")
         results.append(
             answer_one(q, args.collection, args.top_k, args.max_tokens,
                        args.temperature, args.show_think, args.show_context,
-                       enable_thinking=args.think or auto_think)
+                       enable_thinking=effective_thinking)
         )
 
     print(f"\n\n{'=' * 72}")

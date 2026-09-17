@@ -2,6 +2,11 @@
 
 對應 `docs/rag-findings.md` Known Issue #7 的待辦。每種模式重複 3 次，每次皆為獨立子行程呼叫 `scripts/rag_answer.py`，不共用任何狀態。
 
+> 本檔案由 `scripts/run_think_ab_test.py` 產生，重跑會覆寫。
+> **判讀結論與填好的標註表在 [`docs/rag-findings.md`](rag-findings.md) 的
+> Known Issue #7**，此處保留原始逐次回答作為稽核紀錄。
+> （GX10 當時尚未設定 GitHub 推送認證，本檔內容由該機器的輸出原樣轉錄。）
+
 - 題目檔：`scripts/data/psf-eim-qa-q3q4-only.txt`
 - 參數：top_k=8, max_tokens=2048, temperature=0.2
 - 產生時間：2026-09-07 18:55:19
@@ -36,14 +41,16 @@
 | Q3 越界跡象 | think 關閉 | 第 3 次 | 而非、傳統的 ERP、業務流程管理、客戶關係管理 |
 | Q4 辨析跡象 | think 關閉 | 第 3 次 | （無） |
 
-## 人工標註表（請填寫）
+## 人工標註表（已填寫）
 
 | 題目 | 模式 | 第1次 | 第2次 | 第3次 | 出現機率 |
 |---|---|---|---|---|---|
-| Q3 越界 | think 開啟 | 有/無 | 有/無 | 有/無 | /3 |
-| Q3 越界 | think 關閉 | 有/無 | 有/無 | 有/無 | /3 |
-| Q4 辨析保留 | think 開啟 | 有/無 | 有/無 | 有/無 | /3 |
-| Q4 辨析保留 | think 關閉 | 有/無 | 有/無 | 有/無 | /3 |
+| Q3 越界 | think 開啟 | 無 | 無 | 無 | **0/3** |
+| Q3 越界 | think 關閉 | 有 | 有 | 有 | **3/3** |
+| Q4 辨析保留 | think 開啟 | 有 | 有 | 有 | **3/3** |
+| Q4 辨析保留 | think 關閉 | 無 | 無 | 無 | **0/3** |
+
+判讀依據與結論見 [`docs/rag-findings.md`](rag-findings.md) Known Issue #7。
 
 ## 完整回答（逐次保留）
 
@@ -95,19 +102,19 @@
 
 #### think 開啟 — 第 1 次
 
-根據文件片段 1 的描述，PSF Enterprise Intelligence Matrix™（PSF EIM）中負責客戶服務的 Agent 是 **PSF Customer Success Agent™**，其職責明確為「負責客戶成功、續約與滿意度維繫」。  
+根據文件片段 1 的描述，PSF Enterprise Intelligence Matrix™（PSF EIM）中負責客戶服務的 Agent 是 **PSF Customer Success Agent™**，其職責明確為「負責客戶成功、續約與滿意度維繫」。
 
 此外，文件片段 3 提到的 **PSF EIM Service Matrix™** 核心模組中亦包含「Customer Success」，但文件未直接說明此模組是否對應特定 Agent 名稱。因此，依據文件片段 1 的明確資訊，答案應為 **PSF Customer Success Agent™**。
 
 #### think 開啟 — 第 2 次
 
-根據文件片段 1 中的描述，PSF Enterprise Intelligence Matrix™（PSF EIM）裡負責客戶服務的 Agent 是 **PSF Customer Success Agent™**，其職責明確為「負責客戶成功、續約與滿意度維繫」。  
+根據文件片段 1 中的描述，PSF Enterprise Intelligence Matrix™（PSF EIM）裡負責客戶服務的 Agent 是 **PSF Customer Success Agent™**，其職責明確為「負責客戶成功、續約與滿意度維繫」。
 
 此外，文件片段 3 提到的 **PSF EIM Service Matrix™** 的核心模組包含「Customer Success」，但未直接指明該模組是否由特定 Agent 執行。因此，最直接對應的 Agent 名稱仍為 **PSF Customer Success Agent™**。
 
 #### think 開啟 — 第 3 次
 
-根據文件片段 1 中的描述，PSF Enterprise Intelligence Matrix™（PSF EIM）裡負責客戶服務的 Agent 是 **PSF Customer Success Agent™**，其職責明確為「負責客戶成功、續約與滿意度維繫」。  
+根據文件片段 1 中的描述，PSF Enterprise Intelligence Matrix™（PSF EIM）裡負責客戶服務的 Agent 是 **PSF Customer Success Agent™**，其職責明確為「負責客戶成功、續約與滿意度維繫」。
 
 此外，文件片段 3 提到的 **PSF EIM Service Matrix™** 的核心模組包含「Customer Success」，但未直接以 Agent 名稱呈現。因此，依據文件中明確列出的 Agent 分類，答案應為 **PSF Customer Success Agent™**。
 
@@ -122,4 +129,3 @@
 #### think 關閉 — 第 3 次
 
 根據文件片段，PSF EIM 裡負責客戶服務的 Agent 是 PSF Customer Success Agent™。
-
