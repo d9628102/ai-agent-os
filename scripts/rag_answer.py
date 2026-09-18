@@ -50,6 +50,8 @@ from rag_common import (  # noqa: E402
     http_json,
     log,
     search,
+    source_filter,
+    verify_sources_exist,
 )
 
 CHAT_URL = os.environ.get("CHAT_URL", "http://localhost:8000/v1/chat/completions")
@@ -190,7 +192,8 @@ def generate(question: str, context: str, max_tokens: int, temperature: float,
 
 
 def answer_one(question, collection, top_k, max_tokens, temperature,
-               show_think, show_context, enable_thinking=DEFAULT_THINKING):
+               show_think, show_context, enable_thinking=DEFAULT_THINKING,
+               query_filter=None):
     print(f"\n{'=' * 72}")
     print(f"Q: {question}")
     print("=" * 72)
@@ -200,10 +203,11 @@ def answer_one(question, collection, top_k, max_tokens, temperature,
     t_embed = time.time() - t0
 
     t1 = time.time()
-    hits = search(collection, vector, top_k=top_k)
+    hits = search(collection, vector, top_k=top_k, query_filter=query_filter)
     t_search = time.time() - t1
     if not hits:
-        die(f"collection '{collection}' 沒有回傳任何檢索結果，可能是空的。")
+        die(f"collection '{collection}' 沒有回傳任何檢索結果，可能是空的"
+            f"（或 query_filter={query_filter!r} 篩不到任何 chunk）。")
 
     context = build_context(hits)
 
@@ -276,6 +280,10 @@ def main():
                     help="低溫度較適合有依據的問答 (預設 0.2)")
     ap.add_argument("--show-think", action="store_true", help="顯示 <think> 推理內容")
     ap.add_argument("--show-context", action="store_true", help="顯示送進模型的完整片段")
+    ap.add_argument("--source", default=None,
+                    help="只檢索指定 source（rag_ingest.py 寫入的來源檔名）的 chunk，"
+                         "對這次執行的所有問題生效——跨文件比對時用來限定只看某一份"
+                         "文件；不指定時行為不變")
     think_group = ap.add_mutually_exclusive_group()
     think_group.add_argument(
         "--think", dest="think", action="store_true", default=None,
@@ -306,6 +314,11 @@ def main():
     source = "預設" if args.think is None else "指定"
 
     ensure_collection(args.collection, create=False)
+    query_filter = None
+    if args.source:
+        verify_sources_exist(args.collection, [args.source])
+        query_filter = source_filter(args.source)
+        log(f"只檢索 source='{args.source}' 的 chunk。")
     detector_note = "，逐題可能依規則自動切換為開啟，見 Known Issue #7" if args.think is None else ""
     log(f"檢索 top_k={args.top_k}，生成模型 {CHAT_MODEL} @ {CHAT_URL}"
         f"，思考模式 {'開啟' if enable_thinking else '關閉'}({source}{detector_note})")
@@ -322,7 +335,7 @@ def main():
         results.append(
             answer_one(q, args.collection, args.top_k, args.max_tokens,
                        args.temperature, args.show_think, args.show_context,
-                       enable_thinking=effective_thinking)
+                       enable_thinking=effective_thinking, query_filter=query_filter)
         )
 
     print(f"\n\n{'=' * 72}")

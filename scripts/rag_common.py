@@ -124,3 +124,48 @@ def search(collection: str, vector, top_k: int = 5, query_filter=None):
     if status != 200:
         die(f"Qdrant 語意搜尋失敗 (HTTP {status}): {resp}")
     return resp.get("result", [])
+
+
+def source_filter(source: str) -> dict:
+    """組出限定單一 source 的 Qdrant filter，跟 search()/scroll 的 filter 參數搭配用。"""
+    return {"must": [{"key": "source", "match": {"value": source}}]}
+
+
+def distinct_sources(sources) -> list:
+    """去重、濾掉空值（None/空字串）、排序——純邏輯，不牽涉 Qdrant 呼叫。
+    決定 verify_sources_exist() 實際要去查哪些 source，避免同一個 source
+    在問題清單裡出現多次就重複查詢多次。"""
+    return sorted(set(s for s in sources if s))
+
+
+def missing_sources(source_exists: dict) -> list:
+    """source_exists: {source: bool}（bool 是那個 source 是否至少有 1 個
+    chunk）。回傳排序後、不存在的 source 清單——純邏輯，不牽涉 Qdrant 呼叫。
+    verify_sources_exist() 查完每個 source 之後，用這個函式判斷哪些算
+    「找不到」。"""
+    return sorted(s for s, found in source_exists.items() if not found)
+
+
+def verify_sources_exist(collection: str, sources) -> None:
+    """跨文件比對的前置檢查：問題清單裡引用的每個 source，在真正開始跑批次
+    （花錢跑 LLM）之前，先確認至少有 1 個 chunk 存在。source 打錯字時
+    Qdrant filter 只會回傳空結果，不會報錯——如果不先檢查，會讓
+    answer_one() 在批次跑到一半時才因為 hits 為空而 die()，白白浪費前面
+    幾題的呼叫。任何一個 source 查無結果，就在跑第一題之前直接死掉，一次
+    列出所有有問題的 source，不要一個一個抓。"""
+    source_exists = {}
+    for source in distinct_sources(sources):
+        status, resp = http_json(
+            "POST",
+            f"{QDRANT_URL}/collections/{collection}/points/scroll",
+            {"filter": source_filter(source), "limit": 1, "with_payload": False},
+        )
+        if status != 200:
+            die(f"查詢 source '{source}' 是否存在時失敗 (HTTP {status}): {resp}")
+        source_exists[source] = bool(resp.get("result", {}).get("points"))
+    missing = missing_sources(source_exists)
+    if missing:
+        die(
+            f"Collection '{collection}' 裡找不到以下 source 的任何 chunk，"
+            f"請確認檔名是否打錯字或還沒 ingest：{missing}"
+        )

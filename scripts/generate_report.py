@@ -40,7 +40,14 @@ from rag_answer import (  # noqa: E402
     answer_one,
     detect_think_reason,
 )
-from rag_common import die, ensure_collection, http_json, log  # noqa: E402
+from rag_common import (  # noqa: E402
+    die,
+    ensure_collection,
+    http_json,
+    log,
+    source_filter,
+    verify_sources_exist,
+)
 from numeric_consistency import (  # noqa: E402
     check_group_consistency,
     extract_metric_value,
@@ -287,12 +294,16 @@ def render_consistency_section(consistency_results) -> str:
                 ext = e["extraction"]
                 review_note = "（⚠️ 此題答案本身待人工複核，數字可信度打折扣）" if e["needs_review"] else ""
                 heading = e["heading"] or "（無法定位到具體檢索片段）"
-                lines.append(f"- 「{e['question']}」→ **{ext['raw_value']}**"
+                source_note = f"［來源文件：{e['source']}］" if e.get("source") else ""
+                lines.append(f"- 「{e['question']}」{source_note}→ **{ext['raw_value']}**"
                               f"（來源：{heading}）{review_note}")
             lines.append("")
         elif r["status"] == "consistent":
             value = found[0]["extraction"]["raw_value"] if found else "?"
-            lines.append(f"- ✅ **{r['metric']}**：{len(found)} 種問法皆得到一致數字（{value}）")
+            sources = sorted({e["source"] for e in found if e.get("source")})
+            source_note = f"，涵蓋文件：{'、'.join(sources)}" if sources else ""
+            lines.append(f"- ✅ **{r['metric']}**：{len(found)} 筆記錄皆得到一致數字"
+                          f"（{value}）{source_note}")
         else:
             lines.append(f"- ℹ️ **{r['metric']}**：資料不足以比對（成功抽取到數字的題目少於 2 題）")
     lines.append("")
@@ -305,6 +316,15 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
                      think_override, title, chat_url=CHAT_URL, chat_model=CHAT_MODEL,
                      detect_red_flags=False):
     ensure_collection(collection, create=False)
+    referenced_sources = [item.get("source") for item in questions if item.get("source")]
+    if referenced_sources:
+        verify_sources_exist(collection, referenced_sources)
+    # 為什麼跨文件比對需要真正的 source 篩選、不能只靠語意相似度自然分開：
+    # 實測過同一句問題不加篩選檢索兩份不同文件時，最高分是文件A的片段
+    # （0.7247），但第二名是文件B的片段（0.6504）——分數差距不大，代表
+    # embedding 的語意相似度並不會自動尊重文件邊界，兩份談論同一個指標的
+    # 文件內容分數本來就會很接近。沒有 query_filter 真正限制檢索範圍，
+    # 兩份文件的內容就是會混在一起。
 
     sections = []
     toc = []
@@ -322,10 +342,13 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         else:
             enable_thinking = think_override
 
-        log(f"({i}/{len(questions)}) 產生答案：{question}")
+        source = item.get("source")
+        log(f"({i}/{len(questions)}) 產生答案：{question}"
+            + (f"（限定 source={source}）" if source else ""))
         result = answer_one(
             question, collection, top_k, max_tokens, temperature,
             show_think=False, show_context=False, enable_thinking=enable_thinking,
+            query_filter=source_filter(source) if source else None,
         )
 
         log(f"({i}/{len(questions)}) 跑 QA 檢查...")
@@ -347,6 +370,7 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
             groups[group_id]["entries"].append({
                 "question": question, "extraction": extraction,
                 "heading": heading, "needs_review": qa["needs_review"],
+                "source": source,
             })
 
         red_flag_title = None
@@ -403,14 +427,44 @@ GROUP_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
+SOURCE_TAG_RE = re.compile(r"^\[source:\s*(?P<src>[^\]]+)\]\s*(?P<rest>.*)$")
+
+
+def parse_source_tag(line: str):
+    """剝掉一行問題前面選擇性的 `[source: <檔名>]` 前綴。回傳
+    (source, remaining_question)——沒有前綴時 source 是 None、
+    remaining_question 是原字串不變。純邏輯，跟 load_questions() 的檔案
+    I/O 分開，方便測試。"""
+    m = SOURCE_TAG_RE.match(line)
+    if not m:
+        return None, line
+    return m.group("src").strip(), m.group("rest").strip()
+
 
 def load_questions(path):
-    """回傳 [{"question": str, "group": str|None, "metric": str|None}, ...]。
+    """回傳 [{"question": str, "group": str|None, "metric": str|None,
+    "source": str|None}, ...]。
 
     `## group: <id> | metric: <名稱>` 是可選的分組標記，標記之後的問題都
     屬於該組，直到下一個標記或檔案結束；標記之前（或整份檔案都沒有標記）
-    的問題 group/metric 都是 None，不參與數字一致性檢查——舊的問題清單
-    檔案完全不用改，行為不變。
+    的問題 group/metric 都是 None，不參與數字一致性檢查。
+
+    每一行問題前面可以選擇性加 `[source: <檔名>]` 前綴，把這一題的檢索範圍
+    限定在該來源文件——跨文件比對時，同一個 group 底下不同行指向不同
+    source，就是「同一個問題分別在不同文件範圍內各檢索一次」。沒有這個
+    前綴時 source 是 None，檢索範圍不受限，跟舊行為一致。
+
+    這兩個標記都是可選、獨立的——舊的問題清單檔案完全不用改。
+
+    設計問題清單時的一個真實教訓（跨文件比對驗證時踩過）：每一行的問法要
+    夠精確，指向該份文件裡最明確記載這個指標的段落，不要用籠統問法。用
+    同一句籠統問題（例如「這份文件裡2026年營收預測是多少？」）分別對兩份
+    文件各問一次，如果其中一份文件本身內部就已經對這個指標有多個版本
+    （例如 DD 報告自己就在講「同一份文件三個數字」），模型會把「文件內部
+    已知矛盾」整段摘要出來當答案，抽取邏輯反而可能從裡面挑出一個跟另一份
+    文件恰好一樣的數字，讓真正該抓到的跨文件矛盾被蓋掉、誤判成一致。
+    「同一份文件內部已知的矛盾」跟「這次要測的跨文件矛盾」是兩件不同的
+    事，問法必須夠精確才能把兩者分開。
     """
     if not os.path.isfile(path):
         die(f"找不到問題清單檔案：{path}")
@@ -428,8 +482,10 @@ def load_questions(path):
                 continue
             if line.startswith("#"):
                 continue
+            source, line = parse_source_tag(line)
             questions.append({
                 "question": line, "group": current_group, "metric": current_metric,
+                "source": source,
             })
     return questions
 
