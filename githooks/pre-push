@@ -49,6 +49,7 @@ declare -A TEST_TO_LOGIC=(
   ["tests/test_numeric_consistency.py"]="scripts/numeric_consistency.py"
   ["tests/test_red_flag_detection.py"]="scripts/red_flag_detection.py"
   ["tests/test_crossdoc_helpers.py"]="scripts/rag_common.py"
+  ["tests/test_scoring.py"]="scripts/scoring.py"
 )
 
 run_pytest() {

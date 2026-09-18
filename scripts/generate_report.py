@@ -57,6 +57,11 @@ from red_flag_detection import (  # noqa: E402
     dedupe_red_flags,
     detect_red_flag,
 )
+from scoring import (  # noqa: E402
+    compute_weighted_total,
+    lookup_grade,
+    score_dimension,
+)
 
 # 跟 n8n「QA Deterministic Checks」/「QA LLM Judge」節點目前(修過 bug 後)
 # 的版本對齊,不要照舊版(headings-only judge、逐字比對截斷)。
@@ -312,13 +317,98 @@ def render_consistency_section(consistency_results) -> str:
     return "\n".join(lines)
 
 
+def load_scoring_template(path: str, template_name: str) -> dict:
+    """讀 scripts/data/scoring_templates.json，回傳指定模板名稱的設定。
+    模板名稱打錯字時直接死掉列出可用的模板，不要跑到評分階段才發現——
+    跟 verify_sources_exist() 的 typo 前置檢查同一個原則。"""
+    if not os.path.isfile(path):
+        die(f"找不到評分模板設定檔：{path}")
+    with open(path, "r", encoding="utf-8") as f:
+        templates = json.load(f)
+    if template_name not in templates:
+        die(f"評分模板 '{template_name}' 不存在。可用模板：{sorted(templates)}")
+    return templates[template_name]
+
+
+def render_scoring_section(dimension_results, template) -> str:
+    """評分總表章節，放在紅旗清單、數字一致性檢查之後——評分是最下游、
+    綜合前兩者產出的判斷，理當放在最後。只有 --scoring-template 開啟
+    時才會有內容可放。dimension_results: {維度名稱: score_dimension()
+    的回傳值}，只含問題清單裡實際出現過的維度。"""
+    if not dimension_results:
+        return ""
+    weights = template["dimensions"]
+    lines = [
+        "## 評分總表",
+        "",
+        "> ⚠️ **驗證邊界**：維度評分經 LLM 輔助產生，可能因推理服務並發負載"
+        "狀態出現 ±1 分的浮動，方向性判斷（維度優劣）具參考價值，精確刻度"
+        "建議搭配人工複核。",
+        "",
+        "| 維度 | 分數 | 權重 | 加權小計 |", "|---|---|---|---|",
+    ]
+
+    scored = {}
+    failed_dims = []
+    for dim, result in dimension_results.items():
+        if result["score"] is None:
+            failed_dims.append(dim)
+            lines.append(f"| {dim} | ⚠️ 評分失敗，需人工判斷 | ×{weights[dim]} | — |")
+        else:
+            scored[dim] = result["score"]
+            subtotal = result["score"] * weights[dim]
+            lines.append(f"| {dim} | {result['score']}/{template['max_score_per_dimension']} "
+                         f"| ×{weights[dim]} | {subtotal} |")
+
+    missing_dims = sorted(set(weights) - set(dimension_results))
+    for dim in missing_dims:
+        lines.append(f"| {dim} | ⚠️ 未評分（問題清單未涵蓋此維度） | ×{weights[dim]} | — |")
+
+    lines.append("")
+    if missing_dims or failed_dims:
+        reasons = []
+        if missing_dims:
+            reasons.append(f"問題清單未涵蓋：{'、'.join(missing_dims)}")
+        if failed_dims:
+            reasons.append(f"評分失敗：{'、'.join(failed_dims)}")
+        lines.append(f"> ⚠️ **無法計算總分**——{'；'.join(reasons)}。"
+                     f"以下僅列出已成功評分的維度，不對照等級表。")
+        lines.append("")
+    else:
+        total, max_total = compute_weighted_total(scored, template)
+        grade = lookup_grade(total, template)
+        lines.append(f"**PSF 總評：{total}/{max_total} — {grade['grade']}（{grade['label']}）**")
+        lines.append("")
+
+    for dim, result in dimension_results.items():
+        if result["score"] is None:
+            continue
+        lines.append(f"### {dim}（{result['score']}/{template['max_score_per_dimension']}）")
+        lines.append("")
+        lines.append(f"**評分依據**：{result['rationale']}")
+        lines.append("**引用**：")
+        for item in result["evidence"]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def generate_report(questions, collection, top_k, max_tokens, temperature,
                      think_override, title, chat_url=CHAT_URL, chat_model=CHAT_MODEL,
-                     detect_red_flags=False):
+                     detect_red_flags=False, scoring_template=None):
     ensure_collection(collection, create=False)
     referenced_sources = [item.get("source") for item in questions if item.get("source")]
     if referenced_sources:
         verify_sources_exist(collection, referenced_sources)
+    if scoring_template:
+        referenced_dims = {item.get("dimension") for item in questions if item.get("dimension")}
+        unknown_dims = sorted(referenced_dims - set(scoring_template["dimensions"]))
+        if unknown_dims:
+            die(f"問題清單裡的維度名稱跟模板對不上：{unknown_dims}。"
+                f"模板裡的維度：{sorted(scoring_template['dimensions'])}")
     # 為什麼跨文件比對需要真正的 source 篩選、不能只靠語意相似度自然分開：
     # 實測過同一句問題不加篩選檢索兩份不同文件時，最高分是文件A的片段
     # （0.7247），但第二名是文件B的片段（0.6504）——分數差距不大，代表
@@ -331,6 +421,7 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
     needs_review_count = 0
     groups = {}  # group id -> {"metric": str, "entries": [...]}
     red_flag_entries = []  # [{"question":..., "detection":..., "heading":...}, ...]
+    dimension_entries = {}  # 維度名稱 -> [{"question","answer","detection","group_id"}, ...]
 
     for i, item in enumerate(questions, start=1):
         question = item["question"]
@@ -374,6 +465,7 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
             })
 
         red_flag_title = None
+        detection = None  # 這一題的紅旗判斷結果——維度評分的 bundle 也會用到
         if detect_red_flags:
             log(f"({i}/{len(questions)}) 判斷是否構成紅旗...")
             top_heading = None
@@ -389,6 +481,13 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
                 red_flag_title = detection["title"]
                 log(f"({i}/{len(questions)}) 🚩 判定為紅旗：{red_flag_title}")
 
+        dimension = item.get("dimension")
+        if dimension:
+            dimension_entries.setdefault(dimension, []).append({
+                "question": question, "answer": result["visible"],
+                "detection": detection, "group_id": group_id,
+            })
+
         anchor = slugify_heading(heading_text(i, question))
         toc.append(f"{i}. [{question}](#{anchor})")
         sections.append(render_section(i, result, qa, group_metric=metric,
@@ -398,6 +497,14 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         check_group_consistency(g["metric"], g["entries"]) for g in groups.values()
     ]
     red_flags = dedupe_red_flags(red_flag_entries)
+
+    dimension_results = {}
+    if scoring_template:
+        for dimension, entries in dimension_entries.items():
+            log(f"評分維度「{dimension}」...")
+            dimension_results[dimension] = score_dimension(
+                dimension, entries, consistency_results, chat_url, chat_model,
+            )
 
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     status_line = (
@@ -417,14 +524,26 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         "---",
         "",
     ]
+    scoring_section = (
+        render_scoring_section(dimension_results, scoring_template) if scoring_template else ""
+    )
     return ("\n".join(header) + "\n" + render_red_flags_section(red_flags)
             + render_consistency_section(consistency_results)
+            + scoring_section
             + "\n".join(sections))
 
 
 GROUP_HEADER_RE = re.compile(
     r"^##\s*group:\s*(?P<gid>[^|]+?)\s*\|\s*metric:\s*(?P<metric>.+?)\s*$",
     re.IGNORECASE,
+)
+
+# 故意不接受 `| weight: N`——權重固定寫在模板設定檔裡（見
+# scripts/data/scoring_templates.json），不做每案客製。問題清單裡如果
+# 也能寫權重，會出現「檔案裡的權重」跟「模板裡的權重」兩個來源，容易對
+# 不上又沒人發現；標記只給維度名稱，權重永遠只從模板查。
+DIMENSION_HEADER_RE = re.compile(
+    r"^##\s*dimension:\s*(?P<dim>.+?)\s*$", re.IGNORECASE,
 )
 
 SOURCE_TAG_RE = re.compile(r"^\[source:\s*(?P<src>[^\]]+)\]\s*(?P<rest>.*)$")
@@ -443,11 +562,17 @@ def parse_source_tag(line: str):
 
 def load_questions(path):
     """回傳 [{"question": str, "group": str|None, "metric": str|None,
-    "source": str|None}, ...]。
+    "source": str|None, "dimension": str|None}, ...]。
 
     `## group: <id> | metric: <名稱>` 是可選的分組標記，標記之後的問題都
     屬於該組，直到下一個標記或檔案結束；標記之前（或整份檔案都沒有標記）
     的問題 group/metric 都是 None，不參與數字一致性檢查。
+
+    `## dimension: <名稱>` 是另一個獨立、可選的分組標記，標記之後的問題
+    都屬於該評分維度，直到下一個 dimension 標記或檔案結束——跟 `## group:`
+    互不影響、可以同時生效（同一題可以既屬於一個數字一致性檢查群組，又
+    屬於一個評分維度）。維度只寫名稱，不寫權重——見上面 DIMENSION_HEADER_RE
+    的說明。
 
     每一行問題前面可以選擇性加 `[source: <檔名>]` 前綴，把這一題的檢索範圍
     限定在該來源文件——跨文件比對時，同一個 group 底下不同行指向不同
@@ -470,6 +595,7 @@ def load_questions(path):
         die(f"找不到問題清單檔案：{path}")
     questions = []
     current_group, current_metric = None, None
+    current_dimension = None
     with open(path, "r", encoding="utf-8") as f:
         for raw_line in f:
             line = raw_line.strip()
@@ -480,12 +606,16 @@ def load_questions(path):
                 current_group = m.group("gid").strip()
                 current_metric = m.group("metric").strip()
                 continue
+            dm = DIMENSION_HEADER_RE.match(line)
+            if dm:
+                current_dimension = dm.group("dim").strip()
+                continue
             if line.startswith("#"):
                 continue
             source, line = parse_source_tag(line)
             questions.append({
                 "question": line, "group": current_group, "metric": current_metric,
-                "source": source,
+                "source": source, "dimension": current_dimension,
             })
     return questions
 
@@ -507,16 +637,31 @@ def main():
     ap.add_argument("--detect-red-flags", action="store_true", default=False,
                      help="對每一題的答案額外跑一次紅旗判斷（主張/數字矛盾），"
                           "彙整成報告開頭的「紅旗清單」章節；不開啟時行為不變")
+    ap.add_argument("--scoring-template", default=None,
+                     help="開啟客製評分維度，值是模板名稱（例如「九格」，"
+                          "定義在 --scoring-templates-file）；不指定時完全不跑"
+                          "評分。建議搭配 --detect-red-flags 一起開，評分依據"
+                          "才會引用到紅旗——沒開紅旗偵測時評分依據只能來自答案"
+                          "內容跟數字一致性檢查結果")
+    ap.add_argument("--scoring-templates-file",
+                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "data", "scoring_templates.json"),
+                     help="評分模板設定檔路徑（預設 scripts/data/scoring_templates.json）")
     args = ap.parse_args()
 
     questions = load_questions(args.questions)
     if not questions:
         die(f"{args.questions} 裡沒有找到任何問題。")
 
+    scoring_template = None
+    if args.scoring_template:
+        scoring_template = load_scoring_template(args.scoring_templates_file, args.scoring_template)
+
     t0 = time.time()
     report = generate_report(
         questions, args.collection, args.top_k, args.max_tokens, args.temperature,
         args.think, args.title, detect_red_flags=args.detect_red_flags,
+        scoring_template=scoring_template,
     )
     elapsed = time.time() - t0
 

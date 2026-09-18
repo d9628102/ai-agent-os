@@ -20,6 +20,21 @@ QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333").rstrip("/")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "BAAI/bge-m3")
 VECTOR_SIZE = int(os.environ.get("VECTOR_SIZE", "1024"))
 
+# 共用片段：每一個要求模型輸出結構化 JSON 的 system prompt 都應該接上這段。
+# 由來：score_dimension() 的評分呼叫實測出一個 100% 可重現的失敗——引用內容
+# 裡只要有全角括號＋百分號（例如「（淨利率0.24%）」），模型就會在收尾 JSON
+# 陣列時漏掉結尾的 `]`，10次輸入完全相同的測試全部同樣的方式壞掉，不是隨機
+# 機率問題，重試救不回來。財務文件裡這種寫法（年化衰退62%、毛利率85%）到處
+# 都是，理論上任何一個要求結構化 JSON 輸出的呼叫都可能踩到，不是評分這裡
+# 獨有的風險，所以放在這裡讓三個 system prompt 共用同一段提醒，不要各自用
+# 不同措辭各修一次。
+JSON_OUTPUT_REMINDER = (
+    "輸出 JSON 前，逐項確認陣列（[]）與物件（{}）的括號是否配對完整——"
+    "特別注意如果引用或說明文字裡包含全角括號（（）中文括號）、百分號（%）"
+    "等符號，這些不是 JSON 的結構符號，不要因為看到它們就提前結束陣列或"
+    "物件，結尾務必要有對應的 ] 跟 }。"
+)
+
 
 def die(msg: str) -> None:
     print(f"[ERROR] {msg}", file=sys.stderr)

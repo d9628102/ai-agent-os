@@ -21,7 +21,7 @@ numeric_consistency.py 一樣：不重新設計抽取邏輯，用一次獨立的
 import json
 import re
 
-from rag_common import http_json
+from rag_common import JSON_OUTPUT_REMINDER, http_json
 
 RED_FLAG_SYSTEM_PROMPT = (
     "你是嚴謹的盡職調查分析師。你會看到一則問答的問題、系統回答，以及檢索到的"
@@ -64,6 +64,7 @@ RED_FLAG_SYSTEM_PROMPT = (
     "4. required_action（必要動作）：建議要求對方補充或查證什麼\n"
     "5. severity：high/medium/low 三選一，依對投資判斷的影響程度評定\n"
     "如果不構成紅旗，is_red_flag 填 false，其他欄位都填 null。\n"
+    f"{JSON_OUTPUT_REMINDER}\n"
     "請只輸出一個 JSON 物件，格式為：\n"
     '{"is_red_flag": true/false, "title": "<字串或null>", '
     '"phenomenon": "<字串或null>", "why_it_matters": "<字串或null>", '

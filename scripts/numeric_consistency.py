@@ -24,7 +24,7 @@ generate_report.py 的 `## group: <id> | metric: <名稱>` 語法），這裡只
 import json
 import re
 
-from rag_common import http_json
+from rag_common import JSON_OUTPUT_REMINDER, http_json
 
 EXTRACT_SYSTEM_PROMPT = (
     "你是嚴謹的財務數字查核員。你會看到：一個指定的財務/數量指標名稱、使用"
@@ -41,6 +41,7 @@ EXTRACT_SYSTEM_PROMPT = (
     "3. 同時從回答或檢索片段全文裡找一段能直接證明這個數值的逐字引用（不"
     "超過 40 字，必須是原文照抄，不要自己改寫），填進 source_snippet；找"
     "不到就填 null。\n"
+    f"{JSON_OUTPUT_REMINDER}\n"
     "請只輸出一個 JSON 物件，格式為：\n"
     '{"found": true/false, "raw_value": "<字串或null>", '
     '"value_normalized": <數字或null>, "unit": "<字串或null>", '
