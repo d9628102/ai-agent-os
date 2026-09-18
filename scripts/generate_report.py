@@ -41,6 +41,11 @@ from rag_answer import (  # noqa: E402
     detect_think_reason,
 )
 from rag_common import die, ensure_collection, http_json, log  # noqa: E402
+from numeric_consistency import (  # noqa: E402
+    check_group_consistency,
+    extract_metric_value,
+    locate_source_heading,
+)
 
 # 跟 n8n「QA Deterministic Checks」/「QA LLM Judge」節點目前(修過 bug 後)
 # 的版本對齊,不要照舊版(headings-only judge、逐字比對截斷)。
@@ -169,10 +174,14 @@ def filter_citations(hits, min_score: float = MIN_CITATION_SCORE):
     return [h for h in hits if h.get("score", 0.0) >= min_score]
 
 
-def render_section(index: int, result: dict, qa: dict) -> str:
+def render_section(index: int, result: dict, qa: dict, group_metric: str = None) -> str:
     lines = []
     lines.append(f"## {heading_text(index, result['question'])}")
     lines.append("")
+
+    if group_metric:
+        lines.append(f"🔗 屬於一致性檢查群組：{group_metric}")
+        lines.append("")
 
     if qa["needs_review"]:
         reason_bits = []
@@ -221,15 +230,46 @@ def render_section(index: int, result: dict, qa: dict) -> str:
     return "\n".join(lines)
 
 
+def render_consistency_section(consistency_results) -> str:
+    """數字一致性檢查節，放在目錄之後、逐題內容之前——先看結論，再看細
+    節。只有問題清單裡有 `## group:` 標記時才會有內容可放。"""
+    if not consistency_results:
+        return ""
+    lines = ["## 數字一致性檢查", ""]
+    for r in consistency_results:
+        found = [e for e in r["entries"] if e["extraction"]["found"]]
+        if r["status"] == "conflict":
+            lines.append(f"### ⚠️ {r['metric']} — 數字不一致")
+            lines.append("")
+            for e in found:
+                ext = e["extraction"]
+                review_note = "（⚠️ 此題答案本身待人工複核，數字可信度打折扣）" if e["needs_review"] else ""
+                heading = e["heading"] or "（無法定位到具體檢索片段）"
+                lines.append(f"- 「{e['question']}」→ **{ext['raw_value']}**"
+                              f"（來源：{heading}）{review_note}")
+            lines.append("")
+        elif r["status"] == "consistent":
+            value = found[0]["extraction"]["raw_value"] if found else "?"
+            lines.append(f"- ✅ **{r['metric']}**：{len(found)} 種問法皆得到一致數字（{value}）")
+        else:
+            lines.append(f"- ℹ️ **{r['metric']}**：資料不足以比對（成功抽取到數字的題目少於 2 題）")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def generate_report(questions, collection, top_k, max_tokens, temperature,
-                     think_override, title):
+                     think_override, title, chat_url=CHAT_URL, chat_model=CHAT_MODEL):
     ensure_collection(collection, create=False)
 
     sections = []
     toc = []
     needs_review_count = 0
+    groups = {}  # group id -> {"metric": str, "entries": [...]}
 
-    for i, question in enumerate(questions, start=1):
+    for i, item in enumerate(questions, start=1):
+        question = item["question"]
         if think_override is None:
             auto_think, reason = detect_think_reason(question)
             if auto_think:
@@ -251,9 +291,27 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
             needs_review_count += 1
             log(f"({i}/{len(questions)}) ⚠️ 標記為待人工複核")
 
+        group_id, metric = item.get("group"), item.get("metric")
+        if group_id:
+            log(f"({i}/{len(questions)}) 抽取指標「{metric}」的數字...")
+            extraction = extract_metric_value(
+                metric, question, result["visible"], result["context"],
+                chat_url, chat_model,
+            )
+            heading = locate_source_heading(extraction["source_snippet"], result["hits"])
+            groups.setdefault(group_id, {"metric": metric, "entries": []})
+            groups[group_id]["entries"].append({
+                "question": question, "extraction": extraction,
+                "heading": heading, "needs_review": qa["needs_review"],
+            })
+
         anchor = slugify_heading(heading_text(i, question))
         toc.append(f"{i}. [{question}](#{anchor})")
-        sections.append(render_section(i, result, qa))
+        sections.append(render_section(i, result, qa, group_metric=metric))
+
+    consistency_results = [
+        check_group_consistency(g["metric"], g["entries"]) for g in groups.values()
+    ]
 
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     status_line = (
@@ -273,14 +331,44 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         "---",
         "",
     ]
-    return "\n".join(header) + "\n" + "\n".join(sections)
+    return ("\n".join(header) + "\n" + render_consistency_section(consistency_results)
+            + "\n".join(sections))
+
+
+GROUP_HEADER_RE = re.compile(
+    r"^##\s*group:\s*(?P<gid>[^|]+?)\s*\|\s*metric:\s*(?P<metric>.+?)\s*$",
+    re.IGNORECASE,
+)
 
 
 def load_questions(path):
+    """回傳 [{"question": str, "group": str|None, "metric": str|None}, ...]。
+
+    `## group: <id> | metric: <名稱>` 是可選的分組標記，標記之後的問題都
+    屬於該組，直到下一個標記或檔案結束；標記之前（或整份檔案都沒有標記）
+    的問題 group/metric 都是 None，不參與數字一致性檢查——舊的問題清單
+    檔案完全不用改，行為不變。
+    """
     if not os.path.isfile(path):
         die(f"找不到問題清單檔案：{path}")
+    questions = []
+    current_group, current_metric = None, None
     with open(path, "r", encoding="utf-8") as f:
-        return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            m = GROUP_HEADER_RE.match(line)
+            if m:
+                current_group = m.group("gid").strip()
+                current_metric = m.group("metric").strip()
+                continue
+            if line.startswith("#"):
+                continue
+            questions.append({
+                "question": line, "group": current_group, "metric": current_metric,
+            })
+    return questions
 
 
 def main():
