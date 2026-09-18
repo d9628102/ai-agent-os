@@ -341,9 +341,10 @@ def render_scoring_section(dimension_results, template) -> str:
     lines = [
         "## 評分總表",
         "",
-        "> ⚠️ **驗證邊界**：維度評分經 LLM 輔助產生，可能因推理服務並發負載"
-        "狀態出現 ±1 分的浮動，方向性判斷（維度優劣）具參考價值，精確刻度"
-        "建議搭配人工複核。",
+        "> ⚠️ **驗證邊界**：維度評分經 LLM 輔助產生，多數維度的評分浮動落在"
+        "±1 分內；契合、貢獻兩個維度因評分慣例本身較主觀、缺乏明確依據可"
+        "精確重現，浮動範圍可能更大，建議優先人工複核。方向性判斷（維度"
+        "優劣）具參考價值，精確刻度仍建議搭配人工複核。",
         "",
         "| 維度 | 分數 | 權重 | 加權小計 |", "|---|---|---|---|",
     ]
@@ -377,7 +378,8 @@ def render_scoring_section(dimension_results, template) -> str:
     else:
         total, max_total = compute_weighted_total(scored, template)
         grade = lookup_grade(total, template)
-        lines.append(f"**PSF 總評：{total}/{max_total} — {grade['grade']}（{grade['label']}）**")
+        action_note = f" → {grade['action']}" if grade.get("action") else ""
+        lines.append(f"**PSF 總評：{total}/{max_total} — {grade['grade']}（{grade['label']}）{action_note}**")
         lines.append("")
 
     for dim, result in dimension_results.items():

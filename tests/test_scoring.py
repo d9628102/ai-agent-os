@@ -4,9 +4,10 @@
   think 標籤剝殼、錯誤處理
 - compute_weighted_total()：驗證加權總分計算邏輯、最大可能分數計算方式
   （維度總數 × 上限，不是權重總和 × 上限）、真實案例驗證
-- lookup_grade()：驗證等級判斷邏輯、邊界值處理；真實案例驗證直接讀取
-  scripts/data/scoring_templates.json，不硬編一份複本——設定檔的等級邊界
-  之後如果調整，這條測試會直接反映真實內容，不會安靜地跟設定檔脫鉤
+- lookup_grade()：驗證等級判斷邏輯、邊界值處理（含新增的 action 欄位）；
+  真實案例驗證直接讀取 scripts/data/scoring_templates.json，不硬編一份
+  複本——設定檔的等級邊界之後如果調整，這條測試會直接反映真實內容，不會
+  安靜地跟設定檔脫鉤
 - JSON_OUTPUT_REMINDER 是否真的接進三個 system prompt（numeric_consistency/
   red_flag_detection/scoring）——共用修正是否三處都生效的驗證
 """
@@ -116,7 +117,14 @@ def test_compute_weighted_total_basic(dimension_scores, template, expected):
     assert result == expected, "加權總分與最大可能分數計算錯誤"
 
 
-# compute_weighted_total()：真實案例驗證——日羿智能九個維度分數搭配九格模板權重
+# compute_weighted_total()：真實案例驗證——日羿智能九個維度分數搭配九格模板權重。
+#
+# 這裡的權重（全部是1）跟預期值（16, 45）是訂正過的答案，不是原本測試沒過
+# 才改成這樣規避測試：《PSF六壬合夥生態系統》原始文件「七、九格評分制度」
+# 明文「每格1～5分」「總分45分」，完全沒有權重倍數的描述。這條測試原本用
+# 的權重（市場定位×2/能力×2/風險×2/貢獻×2/共業×3，算出26）是在沒看過原始
+# 文件時反推估計出來的，已確認無依據。訂正後的16分，用日羿智能報告柒章的
+# 九個原始分數直接加總驗證：2+1+1+2+1+1+3+3+2=16。
 @pytest.mark.parametrize("dimension_scores,template,expected", [
     (
         {
@@ -125,12 +133,12 @@ def test_compute_weighted_total_basic(dimension_scores, template, expected):
         },
         {
             "dimensions": {
-                "信用": 1, "資源": 1, "市場定位（權力）": 2, "動機": 1, "能力": 2,
-                "風險": 2, "契合": 1, "貢獻": 2, "共業": 3
+                "信用": 1, "資源": 1, "市場定位（權力）": 1, "動機": 1, "能力": 1,
+                "風險": 1, "契合": 1, "貢獻": 1, "共業": 1
             },
             "max_score_per_dimension": 5
         },
-        (26, 45)
+        (16, 45)
     ),
 ])
 def test_compute_weighted_total_real_case(dimension_scores, template, expected):
@@ -138,11 +146,13 @@ def test_compute_weighted_total_real_case(dimension_scores, template, expected):
     assert result == expected, "真實案例計算結果錯誤"
 
 
-# lookup_grade()：等級判斷邏輯驗證
+# lookup_grade()：等級判斷邏輯驗證。這幾條用合成模板，不帶 action 欄位，
+# 驗證 lookup_grade() 用 .get("action") 讀取時，沒有這個欄位就回傳 None，
+# 不會因為舊模板沒有 action 而報錯。
 @pytest.mark.parametrize("total,template,expected", [
-    (26, {"grade_bands": [{"min": 25, "grade": "P2", "label": "良好"}, {"min": 20, "grade": "P3", "label": "普通"}]}, {"grade": "P2", "label": "良好"}),
-    (21, {"grade_bands": [{"min": 25, "grade": "P2", "label": "良好"}, {"min": 20, "grade": "P3", "label": "普通"}]}, {"grade": "P3", "label": "普通"}),
-    (19, {"grade_bands": [{"min": 25, "grade": "P2", "label": "良好"}, {"min": 20, "grade": "P3", "label": "普通"}]}, {"grade": None, "label": "無法判定等級"}),
+    (26, {"grade_bands": [{"min": 25, "grade": "P2", "label": "良好"}, {"min": 20, "grade": "P3", "label": "普通"}]}, {"grade": "P2", "label": "良好", "action": None}),
+    (21, {"grade_bands": [{"min": 25, "grade": "P2", "label": "良好"}, {"min": 20, "grade": "P3", "label": "普通"}]}, {"grade": "P3", "label": "普通", "action": None}),
+    (19, {"grade_bands": [{"min": 25, "grade": "P2", "label": "良好"}, {"min": 20, "grade": "P3", "label": "普通"}]}, {"grade": None, "label": "無法判定等級", "action": None}),
 ])
 def test_lookup_grade_basic(total, template, expected):
     result = lookup_grade(total, template)
@@ -151,8 +161,8 @@ def test_lookup_grade_basic(total, template, expected):
 
 # lookup_grade()：邊界值處理驗證
 @pytest.mark.parametrize("total,template,expected", [
-    (25, {"grade_bands": [{"min": 25, "grade": "P2", "label": "良好"}]}, {"grade": "P2", "label": "良好"}),
-    (20, {"grade_bands": [{"min": 25, "grade": "P2", "label": "良好"}, {"min": 20, "grade": "P3", "label": "普通"}]}, {"grade": "P3", "label": "普通"}),
+    (25, {"grade_bands": [{"min": 25, "grade": "P2", "label": "良好"}]}, {"grade": "P2", "label": "良好", "action": None}),
+    (20, {"grade_bands": [{"min": 25, "grade": "P2", "label": "良好"}, {"min": 20, "grade": "P3", "label": "普通"}]}, {"grade": "P3", "label": "普通", "action": None}),
 ])
 def test_lookup_grade_boundary(total, template, expected):
     result = lookup_grade(total, template)
@@ -160,8 +170,21 @@ def test_lookup_grade_boundary(total, template, expected):
 
 
 # lookup_grade()：真實案例驗證——直接讀取 scripts/data/scoring_templates.json
-# 的九格模板，不硬編複本。日羿智能 26/45→P2、宣捷幹細胞 21/45→P3 是這個
-# 模板權重/等級表的兩個真實資料點來源，此處對照的就是真實設定檔內容。
+# 的九格模板，不硬編複本。日羿智能 16/45→E、宣捷幹細胞 21/45→D 是這個
+# 模板等級表的兩個真實資料點來源，此處對照的就是真實設定檔內容。
+#
+# 這裡的預期值（16→E、21→D）是訂正過的答案，不是規避測試：
+# - 日羿智能：九個原始分數（2+1+1+2+1+1+3+3+2）直接加總是16，不是套權重
+#   算出來的26。對照《PSF六壬合夥生態系統》的A-E表，16落在「19以下→E級
+#   風險名單→不宜合作」。這個訂正不只是數字校準——日羿智能報告自己的文字
+#   結論是「不建議純財務投資/不建議股權投資/不建議技術合作/不建議合資」，
+#   四個維度全部「不建議」，跟E級「不宜合作」的方向一致；原本套權重算出
+#   的26分對應舊版P2「高風險，附條件合作」，反而讓判斷顯得比報告本身的
+#   立場更溫和——訂正後的方向更準確，不是單純改數字過測試。
+# - 宣捷幹細胞：九個原始分數（2+3+3+2+2+1+3+2+3）直接加總是21，跟報告
+#   本身顯示的「21/45」完全吻合——這是文件之外，第二個獨立支持「無權重」
+#   結論的真實資料點，不是單一案例的巧合。21落在「20–26→D級觀察名單→
+#   低成本接觸」。
 def _load_jiuge_template():
     path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -171,11 +194,11 @@ def _load_jiuge_template():
         return json.load(f)["九格"]
 
 
-@pytest.mark.parametrize("total,expected_grade,expected_label", [
-    (26, "P2", "高風險，附條件合作"),
-    (21, "P3", "高度審慎"),
+@pytest.mark.parametrize("total,expected_grade,expected_label,expected_action", [
+    (16, "E", "風險名單", "不宜合作"),
+    (21, "D", "觀察名單", "低成本接觸"),
 ])
-def test_lookup_grade_real_case(total, expected_grade, expected_label):
+def test_lookup_grade_real_case(total, expected_grade, expected_label, expected_action):
     template = _load_jiuge_template()
     result = lookup_grade(total, template)
     assert result["grade"] == expected_grade, (
@@ -183,6 +206,9 @@ def test_lookup_grade_real_case(total, expected_grade, expected_label):
     )
     assert result["label"] == expected_label, (
         f"total={total} 的 label 應為「{expected_label}」，實際「{result['label']}」"
+    )
+    assert result["action"] == expected_action, (
+        f"total={total} 的 action 應為「{expected_action}」，實際「{result['action']}」"
     )
 
 

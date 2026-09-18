@@ -206,8 +206,10 @@ def compute_weighted_total(dimension_scores: dict, template: dict):
 def lookup_grade(total: int, template: dict) -> dict:
     """依 grade_bands（由高到低的 min 門檻）找出對應等級。純邏輯，
     grade_bands 必須是 min 值遞減排列（模板設定檔本身的責任），這裡只
-    找第一個 total >= min 的區間。"""
+    找第一個 total >= min 的區間。action 是這個等級對應的建議動作（例如
+    「可進入核心合作」）——九格模板的 grade_bands 每一項都有這個欄位；
+    用 .get() 讀取是為了不強制要求舊模板一定要有這個欄位。"""
     for band in template["grade_bands"]:
         if total >= band["min"]:
-            return {"grade": band["grade"], "label": band["label"]}
-    return {"grade": None, "label": "無法判定等級"}
+            return {"grade": band["grade"], "label": band["label"], "action": band.get("action")}
+    return {"grade": None, "label": "無法判定等級", "action": None}
