@@ -46,6 +46,10 @@ from numeric_consistency import (  # noqa: E402
     extract_metric_value,
     locate_source_heading,
 )
+from red_flag_detection import (  # noqa: E402
+    dedupe_red_flags,
+    detect_red_flag,
+)
 
 # 跟 n8n「QA Deterministic Checks」/「QA LLM Judge」節點目前(修過 bug 後)
 # 的版本對齊,不要照舊版(headings-only judge、逐字比對截斷)。
@@ -174,13 +178,18 @@ def filter_citations(hits, min_score: float = MIN_CITATION_SCORE):
     return [h for h in hits if h.get("score", 0.0) >= min_score]
 
 
-def render_section(index: int, result: dict, qa: dict, group_metric: str = None) -> str:
+def render_section(index: int, result: dict, qa: dict, group_metric: str = None,
+                    red_flag_title: str = None) -> str:
     lines = []
     lines.append(f"## {heading_text(index, result['question'])}")
     lines.append("")
 
     if group_metric:
         lines.append(f"🔗 屬於一致性檢查群組：{group_metric}")
+        lines.append("")
+
+    if red_flag_title:
+        lines.append(f"🚩 此題內容被判定為紅旗：{red_flag_title}")
         lines.append("")
 
     if qa["needs_review"]:
@@ -230,6 +239,39 @@ def render_section(index: int, result: dict, qa: dict, group_metric: str = None)
     return "\n".join(lines)
 
 
+SEVERITY_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+
+
+def render_red_flags_section(red_flags) -> str:
+    """紅旗清單，放在目錄之後、數字一致性檢查之前——比一致性檢查更高階，
+    更接近執行摘要的定位。只有 --detect-red-flags 開啟時才會有內容可放。"""
+    if not red_flags:
+        return ""
+    lines = [
+        "## 紅旗清單",
+        "",
+        "> ⚠️ **驗證邊界**：以下紅旗由模型從檢索片段中判斷「主張/數字是否互相"
+        "矛盾」自動抽取，通過驗證只代表檢索與格式化正確，不是對模型語意理解"
+        "能力的嚴格證明——實際判斷仍需人工核對原文。",
+        "",
+    ]
+    for rf in red_flags:
+        icon = SEVERITY_ICON.get(rf["severity"], "⚪")
+        lines.append(f"### {icon} {rf['title']}")
+        lines.append("")
+        lines.append(f"**現象**：{rf['phenomenon']}")
+        lines.append(f"**為何是紅旗**：{rf['why_it_matters']}")
+        lines.append(f"**必要動作**：{rf['required_action']}")
+        questions_str = "、".join(f"「{q}」" for q in rf["matched_questions"])
+        headings = sorted(set(rf["headings"])) if rf["headings"] else []
+        headings_str = "、".join(headings) if headings else "（無法定位到具體片段）"
+        lines.append(f"**出現於**：{questions_str}（相關片段：{headings_str}）")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def render_consistency_section(consistency_results) -> str:
     """數字一致性檢查節，放在目錄之後、逐題內容之前——先看結論，再看細
     節。只有問題清單裡有 `## group:` 標記時才會有內容可放。"""
@@ -260,13 +302,15 @@ def render_consistency_section(consistency_results) -> str:
 
 
 def generate_report(questions, collection, top_k, max_tokens, temperature,
-                     think_override, title, chat_url=CHAT_URL, chat_model=CHAT_MODEL):
+                     think_override, title, chat_url=CHAT_URL, chat_model=CHAT_MODEL,
+                     detect_red_flags=False):
     ensure_collection(collection, create=False)
 
     sections = []
     toc = []
     needs_review_count = 0
     groups = {}  # group id -> {"metric": str, "entries": [...]}
+    red_flag_entries = []  # [{"question":..., "detection":..., "heading":...}, ...]
 
     for i, item in enumerate(questions, start=1):
         question = item["question"]
@@ -305,13 +349,31 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
                 "heading": heading, "needs_review": qa["needs_review"],
             })
 
+        red_flag_title = None
+        if detect_red_flags:
+            log(f"({i}/{len(questions)}) 判斷是否構成紅旗...")
+            top_heading = None
+            if result["hits"]:
+                top_heading = result["hits"][0].get("payload", {}).get("heading_path")
+            detection = detect_red_flag(
+                question, result["visible"], result["context"], chat_url, chat_model,
+            )
+            red_flag_entries.append({
+                "question": question, "detection": detection, "heading": top_heading,
+            })
+            if detection["is_red_flag"]:
+                red_flag_title = detection["title"]
+                log(f"({i}/{len(questions)}) 🚩 判定為紅旗：{red_flag_title}")
+
         anchor = slugify_heading(heading_text(i, question))
         toc.append(f"{i}. [{question}](#{anchor})")
-        sections.append(render_section(i, result, qa, group_metric=metric))
+        sections.append(render_section(i, result, qa, group_metric=metric,
+                                        red_flag_title=red_flag_title))
 
     consistency_results = [
         check_group_consistency(g["metric"], g["entries"]) for g in groups.values()
     ]
+    red_flags = dedupe_red_flags(red_flag_entries)
 
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     status_line = (
@@ -331,7 +393,8 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         "---",
         "",
     ]
-    return ("\n".join(header) + "\n" + render_consistency_section(consistency_results)
+    return ("\n".join(header) + "\n" + render_red_flags_section(red_flags)
+            + render_consistency_section(consistency_results)
             + "\n".join(sections))
 
 
@@ -385,6 +448,9 @@ def main():
                               help="整份報告強制開啟思考模式")
     think_group.add_argument("--no-think", dest="think", action="store_false", default=None,
                               help="整份報告強制關閉思考模式")
+    ap.add_argument("--detect-red-flags", action="store_true", default=False,
+                     help="對每一題的答案額外跑一次紅旗判斷（主張/數字矛盾），"
+                          "彙整成報告開頭的「紅旗清單」章節；不開啟時行為不變")
     args = ap.parse_args()
 
     questions = load_questions(args.questions)
@@ -394,7 +460,7 @@ def main():
     t0 = time.time()
     report = generate_report(
         questions, args.collection, args.top_k, args.max_tokens, args.temperature,
-        args.think, args.title,
+        args.think, args.title, detect_red_flags=args.detect_red_flags,
     )
     elapsed = time.time() - t0
 
