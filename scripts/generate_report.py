@@ -196,13 +196,18 @@ def filter_citations(hits, min_score: float = MIN_CITATION_SCORE):
 
 
 def render_section(index: int, result: dict, qa: dict, group_metric: str = None,
-                    red_flag_title: str = None, veto_title: str = None) -> str:
+                    red_flag_title: str = None, veto_title: str = None,
+                    dimension_name: str = None) -> str:
     lines = []
     lines.append(f"## {heading_text(index, result['question'])}")
     lines.append("")
 
     if group_metric:
         lines.append(f"🔗 屬於一致性檢查群組：{group_metric}")
+        lines.append("")
+
+    if dimension_name:
+        lines.append(f"🎯 屬於評分維度：{dimension_name}")
         lines.append("")
 
     if red_flag_title:
@@ -339,6 +344,44 @@ def load_scoring_template(path: str, template_name: str) -> dict:
     return templates[template_name]
 
 
+def compute_scoring_summary(dimension_results, template):
+    """dimension_results 涵蓋 template 全部維度、且全部成功評分時，回傳
+    {"total", "max_total", "grade"}；只要有維度缺評分或評分失敗，回傳
+    None（跟 render_scoring_section() 判斷「能不能對照等級表」同一個
+    邏輯）。抽成獨立函式是因為報告最上層的veto標示旁邊也要顯示PSF總評
+    （整合驗證發現的缺陷：報頭只有veto結論、要看完整份報告才知道總分，
+    兩個結論沒有真正並列），不能讓兩處各自重複一份「能不能算總分」的
+    判斷邏輯，以後改了一邊忘記改另一邊。純邏輯，不牽涉 LLM。"""
+    if not dimension_results:
+        return None
+    weights = template["dimensions"]
+    missing_dims = set(weights) - set(dimension_results)
+    failed_dims = {dim for dim, result in dimension_results.items() if result["score"] is None}
+    if missing_dims or failed_dims:
+        return None
+    scored = {dim: result["score"] for dim, result in dimension_results.items()}
+    total, max_total = compute_weighted_total(scored, template)
+    return {"total": total, "max_total": max_total, "grade": lookup_grade(total, template)}
+
+
+def build_scoring_banner_line(dimension_results, template) -> str:
+    """報告最上層的PSF總評標示，跟不合作紅線標示並列顯示——即使報頭原本
+    只有veto結論，讀者也能同時看到總分等級，不用往下翻到評分總表章節。
+    沒有 dimension_results（沒開 --scoring-template，或問題清單沒有
+    dimension 標記）或算不出總分（有維度缺評分/評分失敗）時回傳 None，
+    這一行完全不顯示，跟 build_veto_banner_line() 同一個「沒用到就不
+    出現」慣例。"""
+    if not dimension_results or not template:
+        return None
+    summary = compute_scoring_summary(dimension_results, template)
+    if summary is None:
+        return None
+    grade = summary["grade"]
+    action_note = f" → {grade['action']}" if grade.get("action") else ""
+    return (f"**PSF 總評**：{summary['total']}/{summary['max_total']} — "
+            f"{grade['grade']}（{grade['label']}）{action_note}")
+
+
 def render_scoring_section(dimension_results, template) -> str:
     """評分總表章節，放在紅旗清單、數字一致性檢查之後——評分是最下游、
     綜合前兩者產出的判斷，理當放在最後。只有 --scoring-template 開啟
@@ -385,10 +428,11 @@ def render_scoring_section(dimension_results, template) -> str:
                      f"以下僅列出已成功評分的維度，不對照等級表。")
         lines.append("")
     else:
-        total, max_total = compute_weighted_total(scored, template)
-        grade = lookup_grade(total, template)
+        summary = compute_scoring_summary(dimension_results, template)
+        grade = summary["grade"]
         action_note = f" → {grade['action']}" if grade.get("action") else ""
-        lines.append(f"**PSF 總評：{total}/{max_total} — {grade['grade']}（{grade['label']}）{action_note}**")
+        lines.append(f"**PSF 總評：{summary['total']}/{summary['max_total']} — "
+                     f"{grade['grade']}（{grade['label']}）{action_note}**")
         lines.append("")
 
     for dim, result in dimension_results.items():
@@ -577,7 +621,8 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         anchor = slugify_heading(heading_text(i, question))
         toc.append(f"{i}. [{question}](#{anchor})")
         sections.append(render_section(i, result, qa, group_metric=metric,
-                                        red_flag_title=red_flag_title, veto_title=veto_title))
+                                        red_flag_title=red_flag_title, veto_title=veto_title,
+                                        dimension_name=dimension))
 
     consistency_results = [
         check_group_consistency(g["metric"], g["entries"]) for g in groups.values()
@@ -606,6 +651,11 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         f"**產生時間**：{now}",
         f"**報告狀態**：{status_line}",
     ]
+    scoring_banner = (
+        build_scoring_banner_line(dimension_results, scoring_template) if scoring_template else None
+    )
+    if scoring_banner:
+        header.append(scoring_banner)
     veto_banner = build_veto_banner_line(veto_results)
     if veto_banner:
         header.append(veto_banner)
@@ -632,6 +682,14 @@ GROUP_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# `## group: none` 明確清除目前生效的 group/metric——三種標記都是「宣告後
+# 持續生效到下一個同類標記」，原本沒有清除語法，這是整合驗證（五種能力
+# 同時啟用）第一次真正跑出跨主題問題清單時抓到的資料污染缺陷：同一份問題
+# 清單裡先問完一家公司再換另一家公司（或換一份不相關的文件）時，前一段
+# 的標記會不小心延續到新主題的題目上，見 load_questions() docstring 最後
+# 那段「已知的資料污染案例」。
+GROUP_CLEAR_RE = re.compile(r"^##\s*group:\s*none\s*$", re.IGNORECASE)
+
 # 故意不接受 `| weight: N`——權重固定寫在模板設定檔裡（見
 # scripts/data/scoring_templates.json），不做每案客製。問題清單裡如果
 # 也能寫權重，會出現「檔案裡的權重」跟「模板裡的權重」兩個來源，容易對
@@ -647,6 +705,17 @@ DIMENSION_HEADER_RE = re.compile(
 VETO_HEADER_RE = re.compile(
     r"^##\s*veto:\s*(?P<rule>.+?)\s*$", re.IGNORECASE,
 )
+
+# dimension/veto 的清除不需要獨立的正規表達式——`## dimension: none`／
+# `## veto: none` 本身就會被上面兩個 HEADER_RE 正常捕捉成 dim="none"／
+# rule="none"，load_questions() 只要在賦值前檢查捕捉到的文字是不是（不分
+# 大小寫）"none" 就能決定要清除還是要設值。這跟 group 不一樣——group 的
+# 語法多了 `| metric:` 這段，"## group: none" 缺了這段本來就配不到
+# GROUP_HEADER_RE，所以 group 才需要 GROUP_CLEAR_RE 這個獨立規則。
+# 三種規則名稱（人不明/資源不實/...）跟維度名稱（信用/資源/...，來自
+# scripts/data/scoring_templates.json）都是固定中文詞彙，跟英文的 "none"
+# 不會衝突，用字面比對是安全的。
+_CLEAR_VALUE = "none"
 
 SOURCE_TAG_RE = re.compile(r"^\[source:\s*(?P<src>[^\]]+)\]\s*(?P<rest>.*)$")
 
@@ -688,15 +757,46 @@ def load_questions(path):
 
     這三個標記都是可選、獨立的——舊的問題清單檔案完全不用改。
 
-    設計問題清單時的一個真實教訓（跨文件比對驗證時踩過）：每一行的問法要
-    夠精確，指向該份文件裡最明確記載這個指標的段落，不要用籠統問法。用
-    同一句籠統問題（例如「這份文件裡2026年營收預測是多少？」）分別對兩份
-    文件各問一次，如果其中一份文件本身內部就已經對這個指標有多個版本
-    （例如 DD 報告自己就在講「同一份文件三個數字」），模型會把「文件內部
-    已知矛盾」整段摘要出來當答案，抽取邏輯反而可能從裡面挑出一個跟另一份
-    文件恰好一樣的數字，讓真正該抓到的跨文件矛盾被蓋掉、誤判成一致。
-    「同一份文件內部已知的矛盾」跟「這次要測的跨文件矛盾」是兩件不同的
-    事，問法必須夠精確才能把兩者分開。
+    **標記清除語法**：`## group: none`／`## dimension: none`／
+    `## veto: none` 明確清除目前生效的對應標記，之後的題目回到「不屬於
+    任何群組/維度/veto規則」的狀態，直到遇到下一個真正的標記。三種標記
+    互相獨立，各自要清除各自宣告。
+
+    設計問題清單時的兩個真實教訓：
+
+    1.（跨文件比對驗證時踩過）每一行的問法要夠精確，指向該份文件裡最
+       明確記載這個指標的段落，不要用籠統問法。用同一句籠統問題（例如
+       「這份文件裡2026年營收預測是多少？」）分別對兩份文件各問一次，
+       如果其中一份文件本身內部就已經對這個指標有多個版本（例如 DD 報告
+       自己就在講「同一份文件三個數字」），模型會把「文件內部已知矛盾」
+       整段摘要出來當答案，抽取邏輯反而可能從裡面挑出一個跟另一份文件
+       恰好一樣的數字，讓真正該抓到的跨文件矛盾被蓋掉、誤判成一致。
+       「同一份文件內部已知的矛盾」跟「這次要測的跨文件矛盾」是兩件不同
+       的事，問法必須夠精確才能把兩者分開。
+
+       這個教訓在整合驗證（五種能力同時啟用）時被重新踩到一次：問「DD
+       報告查核後認定的2026年營收預測金額」，但 DD 報告從來沒有給出一個
+       單一認定值——它記錄的正是「同一份文件出現三個版本」這件事本身，
+       所以那題答案裡沒有可抽取的單一數字，跨文件比對群組顯示「資料不足
+       以比對」。問法本身要問「文件裡列出的數字是多少」，不能問「認定的
+       數字是多少」去假設一個文件本身沒給出的結論。
+
+    2.（整合驗證第一次真正跑跨主題問題清單時踩到，之前每個功能分開驗證
+       時從來沒遇到）三種標記都是「宣告後持續生效到下一個同類標記」，
+       同一份問題清單裡如果先問完一家公司/一份主題再換到另一家公司/
+       另一份不相關文件，前一段殘留的標記會不小心延續到新主題的題目上，
+       造成真實的資料污染，不是理論風險。實際發生過的兩個案例：
+       (a) veto誤判——換到 Branes.AI 的跨文件比對題時，沒清掉前一段
+       日羿智能的 `## veto: 風險不揭露`，這題被誤判觸發，跟真正的股權
+       未揭露案例並列在同一條規則底下，但這題的內容（DD報告沒寫出最終
+       認定的營收數字）根本不屬於風險不揭露的定義範圍（法律/債務/糾紛/
+       黑箱/隱性股東不揭露）。(b) 評分污染——同一個原因，日羿的
+       `## dimension: 信用` 沒清掉，Branes 的營收數字矛盾被當成日羿信用
+       維度的評分依據引用進去，實際進了日羿的總分計算。換主題、換文件
+       時，一定要用清除語法把上一段的標記收掉，不要假設「反正這題有
+       source標記限定檢索範圍，標記應該不會有影響」——source只限制檢索
+       範圍，不影響 group/dimension/veto 標記的繼承邏輯，兩者是獨立的
+       機制。
     """
     if not os.path.isfile(path):
         die(f"找不到問題清單檔案：{path}")
@@ -714,13 +814,18 @@ def load_questions(path):
                 current_group = m.group("gid").strip()
                 current_metric = m.group("metric").strip()
                 continue
+            if GROUP_CLEAR_RE.match(line):
+                current_group, current_metric = None, None
+                continue
             dm = DIMENSION_HEADER_RE.match(line)
             if dm:
-                current_dimension = dm.group("dim").strip()
+                dim_value = dm.group("dim").strip()
+                current_dimension = None if dim_value.lower() == _CLEAR_VALUE else dim_value
                 continue
             vm = VETO_HEADER_RE.match(line)
             if vm:
-                current_veto = vm.group("rule").strip()
+                veto_value = vm.group("rule").strip()
+                current_veto = None if veto_value.lower() == _CLEAR_VALUE else veto_value
                 continue
             if line.startswith("#"):
                 continue
@@ -730,6 +835,27 @@ def load_questions(path):
                 "source": source, "dimension": current_dimension, "veto": current_veto,
             })
     return questions
+
+
+def render_tag_table(questions) -> str:
+    """把 load_questions() 解析出的標記逐題印成一份對照表——`--dry-run`
+    用這個在真正花時間跑報告之前，讓人工先自己核對標記有沒有正確延續/
+    清除，特別是跨主題問題清單（換公司、換文件）最容易在這裡出問題（見
+    load_questions() docstring 裡記錄的資料污染案例：整合驗證第一次真正
+    跑跨主題問題清單時，才發現前一段的標記會不小心延續到新主題的題目
+    上，那次錯誤花了完整跑一次報告、包括全部 LLM 呼叫才發現）。純邏輯，
+    不牽涉 LLM，不觸發任何檢索或生成。"""
+    lines = [
+        f"{'#':<4}{'source':<28}{'group':<10}{'metric':<18}{'dimension':<16}{'veto':<12}問題",
+        "-" * 110,
+    ]
+    for i, item in enumerate(questions, start=1):
+        lines.append(
+            f"{i:<4}{item['source'] or '-':<28}{item['group'] or '-':<10}"
+            f"{item['metric'] or '-':<18}{item['dimension'] or '-':<16}"
+            f"{item['veto'] or '-':<12}{item['question']}"
+        )
+    return "\n".join(lines)
 
 
 def main():
@@ -759,11 +885,20 @@ def main():
                      default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                           "data", "scoring_templates.json"),
                      help="評分模板設定檔路徑（預設 scripts/data/scoring_templates.json）")
+    ap.add_argument("--dry-run", action="store_true", default=False,
+                     help="只解析問題清單、印出每題的 source/group/metric/"
+                          "dimension/veto 標記對照表，不跑檢索或生成，也不"
+                          "產生報告——設計跨主題問題清單時先用這個自檢標記"
+                          "有沒有正確延續/清除")
     args = ap.parse_args()
 
     questions = load_questions(args.questions)
     if not questions:
         die(f"{args.questions} 裡沒有找到任何問題。")
+
+    if args.dry_run:
+        print(render_tag_table(questions))
+        return
 
     scoring_template = None
     if args.scoring_template:
