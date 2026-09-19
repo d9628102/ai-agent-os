@@ -62,6 +62,11 @@ from scoring import (  # noqa: E402
     lookup_grade,
     score_dimension,
 )
+from veto_check import (  # noqa: E402
+    VETO_RULES,
+    detect_veto,
+    summarize_veto_results,
+)
 
 # 跟 n8n「QA Deterministic Checks」/「QA LLM Judge」節點目前(修過 bug 後)
 # 的版本對齊,不要照舊版(headings-only judge、逐字比對截斷)。
@@ -191,7 +196,7 @@ def filter_citations(hits, min_score: float = MIN_CITATION_SCORE):
 
 
 def render_section(index: int, result: dict, qa: dict, group_metric: str = None,
-                    red_flag_title: str = None) -> str:
+                    red_flag_title: str = None, veto_title: str = None) -> str:
     lines = []
     lines.append(f"## {heading_text(index, result['question'])}")
     lines.append("")
@@ -202,6 +207,10 @@ def render_section(index: int, result: dict, qa: dict, group_metric: str = None,
 
     if red_flag_title:
         lines.append(f"🚩 此題內容被判定為紅旗：{red_flag_title}")
+        lines.append("")
+
+    if veto_title:
+        lines.append(f"🚫 此題內容被判定觸發不合作紅線：{veto_title}")
         lines.append("")
 
     if qa["needs_review"]:
@@ -398,6 +407,57 @@ def render_scoring_section(dimension_results, template) -> str:
     return "\n".join(lines)
 
 
+def render_veto_section(veto_results) -> str:
+    """不合作紅線檢查章節，放在評分總表之後——這是比評分更底線的判斷，
+    不管九格總分多高，觸發任一條veto都建議不合作，理當放在報告最後面
+    的判斷章節。veto_results: summarize_veto_results() 的回傳值，只有
+    問題清單裡有 `## veto:` 標記時才會有內容可放。"""
+    if not veto_results:
+        return ""
+    lines = [
+        "## 不合作紅線檢查",
+        "",
+        "> ⚠️ **驗證邊界**：以下判斷依《PSF六壬合夥生態系統》「五不合作」"
+        "條款，由模型輔助判斷。矛盾型（資源不實）跟缺失型（人不明、"
+        "權責不清、利益不明、風險不揭露）用不同的判斷邏輯——矛盾型要找"
+        "『主張跟查核結果對不上』，缺失型要找『文件明確承認揭露不完整』，"
+        "單純沒提到不算缺失。通過驗證只代表檢索與格式化正確，不是對模型"
+        "語意理解能力的嚴格證明，實際判斷仍需人工核對原文。",
+        "",
+    ]
+    for rule_name, result in veto_results.items():
+        if not result["triggered"]:
+            lines.append(f"- ✅ **{rule_name}**：未觸發")
+            continue
+        lines.append(f"### 🚫 {rule_name}")
+        lines.append("")
+        for entry in result["entries"]:
+            lines.append(f"**現象**：{entry['phenomenon']}")
+            lines.append(f"**依據**：{entry['basis']}")
+            lines.append(f"**建議**：{entry['suggested_action']}")
+            heading = entry["heading"] or "（無法定位到具體片段）"
+            lines.append(f"**出現於**：「{entry['question']}」（相關片段：{heading}）")
+            lines.append("")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_veto_banner_line(veto_results) -> str:
+    """報告最上層的veto否決標示，跟報告狀態行並列——即使九格總分是A級
+    核心夥伴，觸發veto時這一行一樣顯示「建議不合作」，兩個結論並存，
+    不互相掩蓋。沒有任何veto被標記測試過時回傳 None，這一行完全不顯示
+    （跟章節「沒用到就不出現」同一個慣例，避免舊報告多一行視覺噪音）。
+    純邏輯，抽成獨立函式方便測試這段組字邏輯。"""
+    if not veto_results:
+        return None
+    triggered_rules = [rule for rule, result in veto_results.items() if result["triggered"]]
+    if triggered_rules:
+        return f"**不合作紅線**：🚫 觸發「{'、'.join(triggered_rules)}」——建議不合作"
+    return "**不合作紅線**：✅ 未觸發"
+
+
 def generate_report(questions, collection, top_k, max_tokens, temperature,
                      think_override, title, chat_url=CHAT_URL, chat_model=CHAT_MODEL,
                      detect_red_flags=False, scoring_template=None):
@@ -411,6 +471,11 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         if unknown_dims:
             die(f"問題清單裡的維度名稱跟模板對不上：{unknown_dims}。"
                 f"模板裡的維度：{sorted(scoring_template['dimensions'])}")
+    referenced_vetoes = {item.get("veto") for item in questions if item.get("veto")}
+    unknown_vetoes = sorted(referenced_vetoes - set(VETO_RULES))
+    if unknown_vetoes:
+        die(f"問題清單裡的veto規則名稱跟文件定義的五條對不上：{unknown_vetoes}。"
+            f"合法規則：{sorted(VETO_RULES)}")
     # 為什麼跨文件比對需要真正的 source 篩選、不能只靠語意相似度自然分開：
     # 實測過同一句問題不加篩選檢索兩份不同文件時，最高分是文件A的片段
     # （0.7247），但第二名是文件B的片段（0.6504）——分數差距不大，代表
@@ -424,6 +489,7 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
     groups = {}  # group id -> {"metric": str, "entries": [...]}
     red_flag_entries = []  # [{"question":..., "detection":..., "heading":...}, ...]
     dimension_entries = {}  # 維度名稱 -> [{"question","answer","detection","group_id"}, ...]
+    veto_entries = []  # [{"question":..., "rule":..., "detection":..., "heading":...}, ...]
 
     for i, item in enumerate(questions, start=1):
         question = item["question"]
@@ -490,10 +556,28 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
                 "detection": detection, "group_id": group_id,
             })
 
+        veto_title = None
+        veto_rule = item.get("veto")
+        if veto_rule:
+            log(f"({i}/{len(questions)}) 檢查是否觸發不合作紅線「{veto_rule}」...")
+            top_heading = None
+            if result["hits"]:
+                top_heading = result["hits"][0].get("payload", {}).get("heading_path")
+            veto_detection = detect_veto(
+                veto_rule, question, result["visible"], result["context"], chat_url, chat_model,
+            )
+            veto_entries.append({
+                "question": question, "rule": veto_rule,
+                "detection": veto_detection, "heading": top_heading,
+            })
+            if veto_detection["is_veto_triggered"]:
+                veto_title = veto_rule
+                log(f"({i}/{len(questions)}) 🚫 觸發不合作紅線：{veto_rule}")
+
         anchor = slugify_heading(heading_text(i, question))
         toc.append(f"{i}. [{question}](#{anchor})")
         sections.append(render_section(i, result, qa, group_metric=metric,
-                                        red_flag_title=red_flag_title))
+                                        red_flag_title=red_flag_title, veto_title=veto_title))
 
     consistency_results = [
         check_group_consistency(g["metric"], g["entries"]) for g in groups.values()
@@ -508,6 +592,8 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
                 dimension, entries, consistency_results, chat_url, chat_model,
             )
 
+    veto_results = summarize_veto_results(veto_entries) if veto_entries else {}
+
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     status_line = (
         f"⚠️ {len(questions)} 段中有 {needs_review_count} 段待人工複核"
@@ -519,6 +605,11 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         "",
         f"**產生時間**：{now}",
         f"**報告狀態**：{status_line}",
+    ]
+    veto_banner = build_veto_banner_line(veto_results)
+    if veto_banner:
+        header.append(veto_banner)
+    header += [
         "",
         "## 目錄",
         *toc,
@@ -532,6 +623,7 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
     return ("\n".join(header) + "\n" + render_red_flags_section(red_flags)
             + render_consistency_section(consistency_results)
             + scoring_section
+            + render_veto_section(veto_results)
             + "\n".join(sections))
 
 
@@ -546,6 +638,14 @@ GROUP_HEADER_RE = re.compile(
 # 不上又沒人發現；標記只給維度名稱，權重永遠只從模板查。
 DIMENSION_HEADER_RE = re.compile(
     r"^##\s*dimension:\s*(?P<dim>.+?)\s*$", re.IGNORECASE,
+)
+
+# 跟 DIMENSION_HEADER_RE 同一個道理：veto規則名稱是《PSF六壬合夥生態
+# 系統》第十四節定義的固定五條（見 veto_check.VETO_RULES），不是每案
+# 客製的東西，這裡只接受規則名稱，合法性檢查在 generate_report() 裡跑
+# 報告前就做（跟 unknown_dims 檢查同一個模式）。
+VETO_HEADER_RE = re.compile(
+    r"^##\s*veto:\s*(?P<rule>.+?)\s*$", re.IGNORECASE,
 )
 
 SOURCE_TAG_RE = re.compile(r"^\[source:\s*(?P<src>[^\]]+)\]\s*(?P<rest>.*)$")
@@ -564,7 +664,7 @@ def parse_source_tag(line: str):
 
 def load_questions(path):
     """回傳 [{"question": str, "group": str|None, "metric": str|None,
-    "source": str|None, "dimension": str|None}, ...]。
+    "source": str|None, "dimension": str|None, "veto": str|None}, ...]。
 
     `## group: <id> | metric: <名稱>` 是可選的分組標記，標記之後的問題都
     屬於該組，直到下一個標記或檔案結束；標記之前（或整份檔案都沒有標記）
@@ -576,12 +676,17 @@ def load_questions(path):
     屬於一個評分維度）。維度只寫名稱，不寫權重——見上面 DIMENSION_HEADER_RE
     的說明。
 
+    `## veto: <規則名稱>` 是第三個獨立、可選的分組標記，標記之後的問題
+    都屬於該veto規則的檢查對象，直到下一個 veto 標記或檔案結束——跟
+    `## group:`/`## dimension:` 一樣互不影響、可以同時生效。veto不需要
+    每題都測，完全由人工標記決定這題要測哪一條，不做自動判斷。
+
     每一行問題前面可以選擇性加 `[source: <檔名>]` 前綴，把這一題的檢索範圍
     限定在該來源文件——跨文件比對時，同一個 group 底下不同行指向不同
     source，就是「同一個問題分別在不同文件範圍內各檢索一次」。沒有這個
     前綴時 source 是 None，檢索範圍不受限，跟舊行為一致。
 
-    這兩個標記都是可選、獨立的——舊的問題清單檔案完全不用改。
+    這三個標記都是可選、獨立的——舊的問題清單檔案完全不用改。
 
     設計問題清單時的一個真實教訓（跨文件比對驗證時踩過）：每一行的問法要
     夠精確，指向該份文件裡最明確記載這個指標的段落，不要用籠統問法。用
@@ -598,6 +703,7 @@ def load_questions(path):
     questions = []
     current_group, current_metric = None, None
     current_dimension = None
+    current_veto = None
     with open(path, "r", encoding="utf-8") as f:
         for raw_line in f:
             line = raw_line.strip()
@@ -612,12 +718,16 @@ def load_questions(path):
             if dm:
                 current_dimension = dm.group("dim").strip()
                 continue
+            vm = VETO_HEADER_RE.match(line)
+            if vm:
+                current_veto = vm.group("rule").strip()
+                continue
             if line.startswith("#"):
                 continue
             source, line = parse_source_tag(line)
             questions.append({
                 "question": line, "group": current_group, "metric": current_metric,
-                "source": source, "dimension": current_dimension,
+                "source": source, "dimension": current_dimension, "veto": current_veto,
             })
     return questions
 

@@ -12,6 +12,13 @@ test_generation_agent.py
 絕對不讓它自己核准/收錄」——這裡的人工核准點更早,在測試案例被信任、進
 版控之前就要經過人看,不是等測試失敗才靠 override。
 
+生成後的機械式檢查(find_orphan_think_tags):孤立、沒有配對開頭 <think> 的
+結尾 </think> 標籤,已經連續在四輪不同功能的測試草稿裡出現過。SYSTEM_PROMPT
+的第 6 條已經明文禁止,但實測證明 prompt 規則對模型的約束力不到 100%,
+所以改成用字串掃描機械攔截:抓到就視為生成失敗、重新生成一次,兩次都有
+就直接中止、不寫草稿檔。理由是人工審核的時間應該花在看斷言邏輯對不對,
+不該每次都重新驗證「標籤配對有沒有問題」這種機械檢查本來就該擋掉的事。
+
 Usage:
   python3 scripts/test_generation_agent.py \\
       --target scripts/generate_report.py:slugify_heading \\
@@ -27,6 +34,7 @@ import argparse
 import ast
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -115,11 +123,52 @@ def call_llm(messages, timeout=300):
 
 
 def strip_think_and_fence(text: str) -> str:
-    import re
-    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+    # 只剝開頭那一段模型自己的推理區塊（`^\s*` 錨定），不是全文所有配對標籤。
+    # 這支代理生成的是「測試程式碼」，而測試資料本身就可能合法地包含配對的
+    # <think>...</think> 字串（SYSTEM_PROMPT 第 6 條正是要求這樣寫）。原本
+    # 不錨定的全文取代會把這種測試資料連同推理區塊一起刪掉，草稿語法還是對的、
+    # 測試還會過，但已經測不到剝殼行為——靜默失效比明顯失敗更難發現。更糟的是
+    # 這讓管線系統性偏袒錯誤樣式：寫對（配對標籤）會被刪掉，寫錯（孤立結尾
+    # 標籤）反而原封不動存活，這正是孤立標籤問題連續四輪重複出現的成因之一。
+    text = re.sub(r"^\s*<think>[\s\S]*?</think>", "", text).strip()
     text = re.sub(r"^```(python)?", "", text.strip(), flags=re.IGNORECASE)
     text = re.sub(r"```$", "", text.strip())
     return text.strip()
+
+
+def find_orphan_think_tags(code: str):
+    """找出草稿裡孤立的結尾 </think> 標籤（前面沒有配對的開頭 <think>），
+    回傳 1-based 行號清單，沒有問題時回傳空清單。純字串掃描、不解析 Python
+    語法——這些標籤幾乎都是出現在測試資料的字串常值裡，字串層級掃描最直接，
+    也不會因為草稿本身語法有問題就掃不出來。
+
+    配對規則就是一般的巢狀計數：遇到 <think> 深度加一，遇到 </think> 時
+    深度為 0 就是孤立標籤，否則深度減一。刻意不管「有開頭但沒結尾」那種
+    情況——剝殼邏輯（strip_think_and_fence）只吃配對標籤，沒結尾的開頭
+    標籤留在原地會直接讓語法檢查失敗，不需要這裡重複攔一次。"""
+    depth = 0
+    orphans = []
+    for m in re.finditer(r"</?think>", code):
+        if m.group(0) == "<think>":
+            depth += 1
+        elif depth == 0:
+            orphans.append(code.count("\n", 0, m.start()) + 1)
+        else:
+            depth -= 1
+    return orphans
+
+
+def generate_draft(messages):
+    """呼叫模型生成一份草稿、剝殼、檢查語法，回傳草稿原始碼。語法錯誤直接
+    中止（維持原本行為）——抽成獨立函式是為了讓孤立 think 標籤的機械檢查
+    可以用同一份 messages 重新生成一次。"""
+    raw = call_llm(messages)
+    draft_code = strip_think_and_fence(raw)
+    try:
+        ast.parse(draft_code)
+    except SyntaxError as e:
+        die(f"生成的草稿語法錯誤，不寫入檔案：{e}\n\n原始輸出：\n{raw[:2000]}")
+    return draft_code
 
 
 def run_pytest_on_draft(repo_root: str, draft_path: str):
@@ -169,17 +218,25 @@ def main():
         f"---\n\n這次一定要覆蓋的邊界情況：\n{hints_text}"
     )
 
-    log("呼叫模型生成測試草稿（思考模式開啟，可能要一段時間）...")
-    raw = call_llm([
+    messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
-    ])
-    draft_code = strip_think_and_fence(raw)
+    ]
 
-    try:
-        ast.parse(draft_code)
-    except SyntaxError as e:
-        die(f"生成的草稿語法錯誤，不寫入檔案：{e}\n\n原始輸出：\n{raw[:2000]}")
+    log("呼叫模型生成測試草稿（思考模式開啟，可能要一段時間）...")
+    draft_code = generate_draft(messages)
+
+    orphans = find_orphan_think_tags(draft_code)
+    if orphans:
+        log(f"機械檢查攔下：草稿第 {orphans} 行出現孤立的 </think> 結尾標籤"
+            f"（沒有配對的開頭 <think>）。這是重複出現過四輪的生成錯誤，"
+            f"直接視為生成失敗，重新生成一次...")
+        draft_code = generate_draft(messages)
+        orphans = find_orphan_think_tags(draft_code)
+        if orphans:
+            die(f"重新生成後第 {orphans} 行仍然有孤立的 </think> 標籤，"
+                f"不寫入草稿檔。人工審核不該花時間抓這種機械性錯誤——"
+                f"請調整 --hint 或 SYSTEM_PROMPT 後重跑。")
 
     out_full = os.path.join(repo_root, args.output)
     os.makedirs(os.path.dirname(out_full), exist_ok=True)
