@@ -98,12 +98,12 @@ def parse_target(spec: str):
     return file_path, func_name
 
 
-def call_llm(messages, timeout=300):
+def call_llm(messages, max_tokens=8192, timeout=300):
     payload = {
         "model": CHAT_MODEL,
         "messages": messages,
         "temperature": 0.2,
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
         # 設計測試案例需要推理邊界情況,不是快速分類,值得開思考模式。
         "chat_template_kwargs": {"enable_thinking": True},
     }
@@ -117,23 +117,68 @@ def call_llm(messages, timeout=300):
     except (urllib.error.HTTPError, urllib.error.URLError) as e:
         die(f"呼叫模型失敗：{e}")
     try:
-        return body["choices"][0]["message"].get("content") or ""
+        choice = body["choices"][0]
     except (KeyError, IndexError, TypeError):
+        die(f"模型回應格式不如預期：{body}")
+    # 截斷要單獨報，不要讓它偽裝成語法錯誤。實際踩過：目標函式多、--hint 多的
+    # 時候，模型光是思考就把額度用完，輸出只有一個沒有結尾的 <think>，剝殼剝
+    # 不掉（剝殼只吃配對標籤），整段推理散文就被當成草稿原始碼，最後由語法
+    # 檢查以「invalid character '，'」報錯——訊息完全指錯方向。
+    if choice.get("finish_reason") == "length":
+        die(f"模型輸出被 max_tokens（{max_tokens}）截斷，草稿不完整、不寫入檔案。"
+            f"目標函式多或 --hint 多的時候，思考內容本身就可能把額度用光、"
+            f"還沒開始寫程式碼。用 --max-tokens 調高後重跑。")
+    try:
+        return choice["message"].get("content") or ""
+    except (KeyError, TypeError):
         die(f"模型回應格式不如預期：{body}")
 
 
-def strip_think_and_fence(text: str) -> str:
-    # 只剝開頭那一段模型自己的推理區塊（`^\s*` 錨定），不是全文所有配對標籤。
-    # 這支代理生成的是「測試程式碼」，而測試資料本身就可能合法地包含配對的
-    # <think>...</think> 字串（SYSTEM_PROMPT 第 6 條正是要求這樣寫）。原本
-    # 不錨定的全文取代會把這種測試資料連同推理區塊一起刪掉，草稿語法還是對的、
-    # 測試還會過，但已經測不到剝殼行為——靜默失效比明顯失敗更難發現。更糟的是
-    # 這讓管線系統性偏袒錯誤樣式：寫對（配對標籤）會被刪掉，寫錯（孤立結尾
-    # 標籤）反而原封不動存活，這正是孤立標籤問題連續四輪重複出現的成因之一。
-    text = re.sub(r"^\s*<think>[\s\S]*?</think>", "", text).strip()
+def _strip_fence(text: str) -> str:
     text = re.sub(r"^```(python)?", "", text.strip(), flags=re.IGNORECASE)
     text = re.sub(r"```$", "", text.strip())
     return text.strip()
+
+
+def _parses_as_python(code: str) -> bool:
+    try:
+        ast.parse(code)
+    except SyntaxError:
+        return False
+    return True
+
+
+def strip_think_and_fence(text: str) -> str:
+    """剝掉開頭那一段模型自己的推理區塊，以及包住程式碼的 markdown fence。
+
+    推理區塊的結尾邊界用「切掉之後剩下的內容能不能當成 Python 解析」決定，
+    而不是用字串樣式去猜。這個作法是連續踩三次坑之後才收斂出來的：
+
+    1. 原本是全文取代所有配對的 <think>...</think>。但這支代理生成的是
+       「測試程式碼」，測試資料本身就可能合法地包含配對標籤字串
+       （SYSTEM_PROMPT 第 6 條正是要求這樣寫），結果那些測試資料被連帶
+       刪掉：草稿語法還是對的、測試還會過，但已經測不到剝殼行為。更糟的是
+       這讓管線系統性偏袒錯誤樣式——寫對（配對標籤）被刪掉，寫錯（孤立結尾
+       標籤）反而原封不動存活，正是孤立標籤問題連續四輪重複出現的成因之一。
+    2. 改成錨定開頭、非貪婪取第一個 </think>。但模型推理時會在散文裡行內
+       引用這個標籤字串（實際踩到：「沒有對應開頭的</think>）」），那個引用
+       被當成區塊結尾，剩下的推理散文被當成程式碼，以「invalid character
+       '）'」這種完全指錯方向的語法錯誤收場。
+    3. 再改成要求結尾標籤必須是該行最後一個東西。模型下一次就把引用寫在
+       行尾了，同樣被誤認——純字串樣式擋不住「散文裡提到這個標籤」這件事。
+
+    所以改成直接編碼真正的需求：逐個 </think> 邊界試，第一個「剩下的內容
+    是合法 Python」的就是真正的結尾。推理散文不會是合法 Python，所以行內
+    引用會自動被跳過。全部邊界都試不出合法 Python 時（例如整段被 max_tokens
+    截斷、根本還沒產出程式碼），原樣回傳，讓呼叫端的語法檢查去報錯。
+    """
+    body = text.lstrip()
+    if body.startswith("<think>"):
+        for m in re.finditer(r"</think>[ \t]*\n?", body):
+            candidate = _strip_fence(body[m.end():])
+            if _parses_as_python(candidate):
+                return candidate
+    return _strip_fence(body)
 
 
 def find_orphan_think_tags(code: str):
@@ -158,11 +203,11 @@ def find_orphan_think_tags(code: str):
     return orphans
 
 
-def generate_draft(messages):
+def generate_draft(messages, max_tokens=8192):
     """呼叫模型生成一份草稿、剝殼、檢查語法，回傳草稿原始碼。語法錯誤直接
     中止（維持原本行為）——抽成獨立函式是為了讓孤立 think 標籤的機械檢查
     可以用同一份 messages 重新生成一次。"""
-    raw = call_llm(messages)
+    raw = call_llm(messages, max_tokens=max_tokens)
     draft_code = strip_think_and_fence(raw)
     try:
         ast.parse(draft_code)
@@ -191,6 +236,9 @@ def main():
     ap.add_argument("--hint", action="append", default=[],
                      help="這次一定要覆蓋的情境描述，可重複指定多個")
     ap.add_argument("--output", required=True, help="草稿輸出路徑（例如 tests/test_xxx_DRAFT.py）")
+    ap.add_argument("--max-tokens", type=int, default=8192,
+                     help="生成上限（預設 8192）。目標函式多或 --hint 多的時候，"
+                          "思考內容可能把額度用光，這時要調高")
     ap.add_argument("--repo-root", default=os.getcwd())
     args = ap.parse_args()
 
@@ -224,14 +272,14 @@ def main():
     ]
 
     log("呼叫模型生成測試草稿（思考模式開啟，可能要一段時間）...")
-    draft_code = generate_draft(messages)
+    draft_code = generate_draft(messages, args.max_tokens)
 
     orphans = find_orphan_think_tags(draft_code)
     if orphans:
         log(f"機械檢查攔下：草稿第 {orphans} 行出現孤立的 </think> 結尾標籤"
             f"（沒有配對的開頭 <think>）。這是重複出現過四輪的生成錯誤，"
             f"直接視為生成失敗，重新生成一次...")
-        draft_code = generate_draft(messages)
+        draft_code = generate_draft(messages, args.max_tokens)
         orphans = find_orphan_think_tags(draft_code)
         if orphans:
             die(f"重新生成後第 {orphans} 行仍然有孤立的 </think> 標籤，"

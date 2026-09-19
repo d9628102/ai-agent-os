@@ -51,6 +51,7 @@ declare -A TEST_TO_LOGIC=(
   ["tests/test_crossdoc_helpers.py"]="scripts/rag_common.py"
   ["tests/test_scoring.py"]="scripts/scoring.py"
   ["tests/test_veto_check.py"]="scripts/veto_check.py"
+  ["tests/test_testgen_helpers.py"]="scripts/test_generation_agent.py"
 )
 
 run_pytest() {
