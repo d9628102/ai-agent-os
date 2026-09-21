@@ -15,24 +15,46 @@
   max_score_per_dimension 都要跟真實系統一致，否則測不到真正的行為
 - render_section() 新增的 dimension_name 參數（🎯 標記）：跟既有三種標記
   （🔗🚩🚫）同時出現時各自獨立一行，不互相覆蓋
+- render_red_flags_section()：驗證紅旗清單格式、severity圖示對應（含未知
+  severity的預設圖示）、headings去重排序、matched_questions格式
+- render_consistency_section()：驗證數字一致性檢查三種狀態（conflict/
+  consistent/其他）處理、僅顯示extraction.found=true的項目、source標註、
+  needs_review複核警語、涵蓋文件清單去重排序
+- render_scoring_section()：驗證評分表格生成、加權小計計算、子章節生成
+  條件、PSF總評顯示條件（含缺分/評分失敗時不顯示）、警告訊息文字跟順序；
+  template一律用真實九格schema（含grade_bands），不虛構不相容結構——這
+  是第二次在測試草稿裡踩到「虛構跟真實系統不相容的資料結構」，詳見
+  docs/rag-findings.md 的記錄
+- render_veto_section()：驗證未觸發規則的一行式顯示、觸發規則的完整四行
+  格式（現象/依據/建議/出現於）、同一規則多筆entries全部列出、heading
+  缺失時的提示文字位置（放在「相關片段」括號裡，不取代question本身）
 - 皆依照現有測試檔案的參數化寫法與斷言風格
 """
 
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
 import pytest
 
 from generate_report import (
+    apply_full_dd_report_defaults,
     build_scoring_banner_line,
+    check_deterministic,
+    check_full_dd_report_tag_coverage,
     compute_scoring_summary,
     filter_citations,
     load_questions,
+    load_scoring_template,
+    render_consistency_section,
+    render_red_flags_section,
+    render_scoring_section,
     render_section,
     render_tag_table,
+    render_veto_section,
     slugify_heading,
 )
 
@@ -381,3 +403,576 @@ def test_render_section_no_markers_when_all_none():
     assert "🎯" not in result
     assert "🚩" not in result
     assert "🚫" not in result
+
+
+# render_red_flags_section()：red_flags為空清單時回傳空字串
+def test_render_red_flags_section_empty():
+    assert render_red_flags_section([]) == ""
+
+
+# render_red_flags_section()：單筆紅旗且severity分別是high/medium/low時要出現對應圖示
+@pytest.mark.parametrize("severity,expected_icon", [
+    ("high", "🔴"),
+    ("medium", "🟡"),
+    ("low", "🟢"),
+    ("unknown", "⚪"),
+])
+def test_render_red_flags_section_severity(severity, expected_icon):
+    red_flags = [{
+        "title": "測試紅旗",
+        "severity": severity,
+        "phenomenon": "現象",
+        "why_it_matters": "原因",
+        "required_action": "動作",
+        "matched_questions": ["問題1"],
+        "headings": []
+    }]
+    result = render_red_flags_section(red_flags)
+    assert expected_icon in result, f"應顯示 {expected_icon} 圖示"
+
+
+# render_red_flags_section()：headings為空清單時該筆要顯示「（無法定位到具體片段）」
+def test_render_red_flags_section_headings_empty():
+    red_flags = [{
+        "title": "測試紅旗",
+        "severity": "medium",
+        "phenomenon": "現象",
+        "why_it_matters": "原因",
+        "required_action": "動作",
+        "matched_questions": ["問題1"],
+        "headings": []
+    }]
+    result = render_red_flags_section(red_flags)
+    assert "（無法定位到具體片段）" in result, "headings 空時應顯示預期提示"
+
+
+# render_red_flags_section()：headings有重複值時輸出要去重且排序後用、串接
+def test_render_red_flags_section_headings_deduplicated():
+    red_flags = [{
+        "title": "測試紅旗",
+        "severity": "medium",
+        "phenomenon": "現象",
+        "why_it_matters": "原因",
+        "required_action": "動作",
+        "matched_questions": ["問題1"],
+        "headings": ["A", "B", "A"]
+    }]
+    result = render_red_flags_section([red_flags[0]])
+    assert "A、B" in result, "headings 應去重排序後用「、」連接"
+
+
+# render_red_flags_section()：matched_questions每個問題要用「」包住再用、串接
+def test_render_red_flags_section_questions_quoted():
+    red_flags = [{
+        "title": "測試紅旗",
+        "severity": "medium",
+        "phenomenon": "現象",
+        "why_it_matters": "原因",
+        "required_action": "動作",
+        "matched_questions": ["問題1", "問題2"],
+        "headings": []
+    }]
+    result = render_red_flags_section([red_flags[0]])
+    assert "「問題1」、「問題2」" in result, "matched_questions 應用「」包覆後用「、」連接"
+
+
+# render_consistency_section()：consistency_results為空清單時回傳空字串
+def test_render_consistency_section_empty():
+    assert render_consistency_section([]) == ""
+
+
+# render_consistency_section()：status="conflict"時只列出entries裡extraction.found=true的項目
+# ——needs_review/heading/source/question 都是 entry 自己的欄位，不是巢狀在
+# extraction 裡面（真正的函式讀 e["needs_review"]/e["heading"]/e["question"]，
+# extraction 裡只放 found/raw_value）
+def test_render_consistency_section_conflict_filtered():
+    results = [{
+        "metric": "測試指標",
+        "status": "conflict",
+        "entries": [
+            {"extraction": {"found": False}, "question": "問題A",
+             "needs_review": False, "heading": "章節A", "source": "文件A"},
+            {"extraction": {"found": True, "raw_value": "100"}, "question": "問題B",
+             "needs_review": False, "heading": "章節", "source": "文件1"},
+        ]
+    }]
+    result = render_consistency_section(results)
+    assert "測試指標 — 數字不一致" in result, "應顯示 conflict 指標"
+    assert "**100**（來源：章節）" in result, "僅顯示 found=True 的項目"
+    assert "問題A" not in result, "found=False 的項目不該出現在輸出裡"
+
+
+# render_consistency_section()：needs_review=true的entry要出現複核警語
+def test_render_consistency_section_needs_review():
+    results = [{
+        "metric": "測試指標",
+        "status": "conflict",
+        "entries": [{
+            "extraction": {"found": True, "raw_value": "100"}, "question": "問題1",
+            "needs_review": True, "heading": "章節", "source": "文件1",
+        }]
+    }]
+    result = render_consistency_section(results)
+    assert "（⚠️ 此題答案本身待人工複核，數字可信度打折扣）" in result, "needs_review 應顯示警語"
+
+
+# render_consistency_section()：source有值時要出現［來源文件：X］標註
+def test_render_consistency_section_source_annotation():
+    results = [{
+        "metric": "測試指標",
+        "status": "conflict",
+        "entries": [{
+            "extraction": {"found": True, "raw_value": "100"}, "question": "問題1",
+            "needs_review": False, "heading": "章節", "source": "文件1",
+        }]
+    }]
+    result = render_consistency_section(results)
+    assert "［來源文件：文件1］" in result, "source 應顯示標註"
+
+
+# render_consistency_section()：status="consistent"時顯示找到的第一筆raw_value跟found筆數，
+# 且涵蓋文件清單要去重排序——兩筆entry故意用重複的文件名測去重
+def test_render_consistency_section_consistent():
+    results = [{
+        "metric": "測試指標",
+        "status": "consistent",
+        "entries": [
+            {"extraction": {"found": True, "raw_value": "100"}, "question": "問題1",
+             "needs_review": False, "heading": "章節", "source": "文件2"},
+            {"extraction": {"found": True, "raw_value": "100"}, "question": "問題2",
+             "needs_review": False, "heading": "章節", "source": "文件1"},
+            {"extraction": {"found": True, "raw_value": "100"}, "question": "問題3",
+             "needs_review": False, "heading": "章節", "source": "文件1"},
+        ]
+    }]
+    result = render_consistency_section(results)
+    assert "✅ **測試指標**：3 筆記錄皆得到一致數字（100）" in result, "應顯示一致結果"
+    assert "涵蓋文件：文件1、文件2" in result, "涵蓋文件清單應去重（文件1只出現一次）且排序"
+
+
+# render_consistency_section()：status是其他值時顯示ℹ️訊息
+def test_render_consistency_section_other_status():
+    results = [{
+        "metric": "測試指標",
+        "status": "unknown",
+        "entries": []
+    }]
+    result = render_consistency_section(results)
+    assert "ℹ️ **測試指標**：資料不足以比對" in result, "其他狀態應顯示提示訊息"
+
+
+def test_render_scoring_section_empty_dimension_results():
+    """dimension_results為空字典時回傳空字串"""
+    result = render_scoring_section({}, {})
+    assert result == "", "空輸入應返回空字串"
+
+
+def test_render_scoring_section_all_success():
+    """所有維度都評分成功時顯示PSF總評行"""
+    dimension_results = {
+        "dim1": {"score": 3, "rationale": "test1", "evidence": ["a"]},
+        "dim2": {"score": 4, "rationale": "test2", "evidence": ["b"]}
+    }
+    template = {
+        "dimensions": {"dim1": 2, "dim2": 3},
+        "max_score_per_dimension": 5,
+        "grade_bands": [
+            {"min": 15, "grade": "A", "label": "優", "action": "可合作"},
+            {"min": 0, "grade": "B", "label": "差", "action": None},
+        ],
+    }
+    expected_summary = compute_scoring_summary(dimension_results, template)
+    expected_grade = expected_summary["grade"]
+    expected_line = f"**PSF 總評：{expected_summary['total']}/{expected_summary['max_total']} — "
+    expected_line += f"{expected_grade['grade']}（{expected_grade['label']}）"
+    if expected_grade.get("action"):
+        expected_line += f" → {expected_grade['action']}"
+    expected_line += "**"
+
+    result = render_scoring_section(dimension_results, template)
+    assert expected_line in result, "應顯示PSF總評行"
+
+
+def test_render_scoring_section_failure_and_missing():
+    """有評分失敗與未評分維度時顯示警告訊息"""
+    dimension_results = {
+        "dim1": {"score": None, "rationale": "", "evidence": []},
+        "dim2": {"score": 4, "rationale": "test", "evidence": ["b"]}
+    }
+    template = {
+        "dimensions": {"dim1": 1, "dim2": 2, "dim3": 3},
+        "max_score_per_dimension": 5
+    }
+
+    result = render_scoring_section(dimension_results, template)
+    assert "| dim1 | ⚠️ 評分失敗，需人工判斷 | ×1 | — |" in result, "評分失敗維度應顯示警告"
+    assert "| dim3 | ⚠️ 未評分（問題清單未涵蓋此維度） | ×3 | — |" in result, "未評分維度應顯示提示"
+    # 原斷言的文字順序跟措辭都跟真正的程式碼對不上：真正的程式碼先組
+    # missing_dims 的理由再組 failed_dims 的理由（順序固定，不是依字母或
+    # 出現順序），措辭是「問題清單未涵蓋：」不是「未評分（問題清單未
+    # 涵蓋）：」——這兩處都是生成階段的既有錯誤，不是這次修正引入的。
+    assert "> ⚠️ **無法計算總分**——問題清單未涵蓋：dim3；評分失敗：dim1。" in result, "應顯示無法計算總分警告"
+
+
+def test_render_scoring_section_weighted_subtotal():
+    """驗證加權小計是否正確計算"""
+    dimension_results = {
+        "dim1": {"score": 3, "rationale": "", "evidence": []},
+        "dim2": {"score": 5, "rationale": "", "evidence": []}
+    }
+    template = {
+        "dimensions": {"dim1": 2, "dim2": 3},
+        "max_score_per_dimension": 5,
+        "grade_bands": [{"min": 0, "grade": "A", "label": "測試等級", "action": None}],
+    }
+
+    result = render_scoring_section(dimension_results, template)
+    assert "| dim1 | 3/5 | ×2 | 6 |" in result, "加權小計應為3×2=6"
+    assert "| dim2 | 5/5 | ×3 | 15 |" in result, "加權小計應為5×3=15"
+
+
+def test_render_scoring_section_success_subsections():
+    """評分成功的維度生成子章節，失敗的不生成"""
+    dimension_results = {
+        "dim1": {"score": 3, "rationale": "reason", "evidence": ["item1", "item2"]},
+        "dim2": {"score": None, "rationale": "", "evidence": []}
+    }
+    template = {"dimensions": {"dim1": 1, "dim2": 1}, "max_score_per_dimension": 5}
+
+    result = render_scoring_section(dimension_results, template)
+    assert "### dim1（3/5）" in result, "成功評分維度應生成子章節"
+    assert "### dim2（" not in result, "評分失敗維度不生成子章節"
+    assert "**評分依據**：reason" in result, "應顯示評分依據"
+    assert "- item1" in result and "- item2" in result, "應顯示引用清單"
+
+
+def test_render_scoring_section_missing_dims():
+    """缺少template裡的維度時顯示未評分提示"""
+    dimension_results = {"dim1": {"score": 3, "rationale": "", "evidence": []}}
+    template = {"dimensions": {"dim1": 1, "dim2": 1}, "max_score_per_dimension": 5}
+
+    result = render_scoring_section(dimension_results, template)
+    assert "| dim2 | ⚠️ 未評分（問題清單未涵蓋此維度） | ×1 | — |" in result, "應顯示未評分維度提示"
+
+
+def test_render_scoring_section_failure_only():
+    """只有評分失敗維度時不顯示總評"""
+    dimension_results = {"dim1": {"score": None, "rationale": "", "evidence": []}}
+    template = {"dimensions": {"dim1": 1}, "max_score_per_dimension": 5}
+
+    result = render_scoring_section(dimension_results, template)
+    assert "> ⚠️ **無法計算總分**——評分失敗：dim1。" in result, "應顯示無法計算總分警告"
+    # 原本斷言 "**PSF 總評**" not in result 是恒真的假陽性——真正的總評行
+    # 格式是 "**PSF 總評：X/Y — ..."，"總評" 後面接的是全角冒號不是 "**"，
+    # 所以 "**PSF 總評**" 這個字面組合永遠不會出現在真正的總評行裡，不管
+    # 邏輯對不對，斷言都會通過，測不到「評分失敗時不該顯示總評」這件事。
+    # 改成比對真正會出現在總評行開頭的字面文字。
+    assert "PSF 總評：" not in result, "評分失敗時不顯示總評行"
+
+
+# render_veto_section()：veto_results為空字典時回傳空字串
+def test_render_veto_section_empty():
+    result = render_veto_section({})
+    assert result == "", "空字典輸入應返回空字串"
+
+
+# render_veto_section()：triggered=false的規則顯示「- ✅ **規則名**：未觸發」
+@pytest.mark.parametrize("veto_results,expected_line", [
+    ({"rule1": {"triggered": False}}, "- ✅ **rule1**：未觸發"),
+    ({"rule2": {"triggered": False, "entries": []}}, "- ✅ **rule2**：未觸發"),
+])
+def test_render_veto_section_not_triggered(veto_results, expected_line):
+    result = render_veto_section(veto_results)
+    assert expected_line in result, f"應包含未觸發規則顯示：{expected_line}"
+
+
+# render_veto_section()：triggered=true的規則顯示「### 🚫 規則名」標題及所有entries
+# ——entries 裡每一筆都要有 question 欄位（真正的函式讀 entry['question']，
+# 沒有這個欄位會直接 KeyError，不是選填的）
+@pytest.mark.parametrize("veto_results,expected_count", [
+    (
+        {
+            "rule1": {
+                "triggered": True,
+                "entries": [
+                    {"question": "q1", "phenomenon": "p1", "basis": "b1",
+                     "suggested_action": "a1", "heading": "h1"},
+                    {"question": "q2", "phenomenon": "p2", "basis": "b2",
+                     "suggested_action": "a2", "heading": None},
+                ]
+            }
+        },
+        1  # 只有一條規則觸發，標題只會出現一次；entries 有兩筆是同一條規則底下的兩筆證據
+    ),
+    (
+        {
+            "rule2": {
+                "triggered": True,
+                "entries": [
+                    {"question": "q3", "phenomenon": "p3", "basis": "b3",
+                     "suggested_action": "a3", "heading": None}
+                ]
+            }
+        },
+        1
+    ),
+])
+def test_render_veto_section_triggered(veto_results, expected_count):
+    result = render_veto_section(veto_results)
+    assert "### 🚫" in result, "應包含觸發規則標題"
+    assert result.count("### 🚫") == expected_count, "應正確顯示觸發規則的標題數量"
+
+
+def test_render_veto_section_multiple_entries_all_listed():
+    """一條規則底下有多筆 entries 時，每一筆都要各自出現現象/依據/建議/
+    出現於四行，不能只列第一筆——這是這條規則跟其他規則的關鍵差異，值得
+    獨立一條測試單獨釘住，不要跟「標題數量」的測試混在一起。"""
+    veto_results = {
+        "rule1": {
+            "triggered": True,
+            "entries": [
+                {"question": "q1", "phenomenon": "p1", "basis": "b1",
+                 "suggested_action": "a1", "heading": "h1"},
+                {"question": "q2", "phenomenon": "p2", "basis": "b2",
+                 "suggested_action": "a2", "heading": None},
+            ]
+        }
+    }
+    result = render_veto_section(veto_results)
+    assert "**現象**：p1" in result and "**現象**：p2" in result
+    assert "**依據**：b1" in result and "**依據**：b2" in result
+    assert "**建議**：a1" in result and "**建議**：a2" in result
+    assert "「q1」" in result and "「q2」" in result
+
+
+# render_veto_section()：entry的heading是None時「出現於」那行要顯示
+# 「（相關片段：（無法定位到具體片段））」——無法定位的提示文字放在
+# 「相關片段」那個括號裡面，不是取代掉question本身，question不管heading
+# 是不是None都照樣顯示
+@pytest.mark.parametrize("heading,expected_fragment_snippet", [
+    (None, "（相關片段：（無法定位到具體片段））"),
+    ("實際片段標題", "（相關片段：實際片段標題）"),
+])
+def test_render_veto_section_heading_handling(heading, expected_fragment_snippet):
+    veto_results = {
+        "rule1": {
+            "triggered": True,
+            "entries": [
+                {"question": "測試問題", "phenomenon": "test",
+                 "basis": "basis", "suggested_action": "action", "heading": heading}
+            ]
+        }
+    }
+    result = render_veto_section(veto_results)
+    assert "「測試問題」" in result, "question 不管 heading 是不是 None 都要照樣顯示"
+    assert expected_fragment_snippet in result, f"應顯示：{expected_fragment_snippet}"
+
+
+# render_veto_section()：完整格式驗證（含邊界情況組合）
+def test_render_veto_section_full_format():
+    veto_results = {
+        "矛盾型資源不實": {"triggered": False},
+        "缺失型人不明": {
+            "triggered": True,
+            "entries": [
+                {
+                    "question": "合作方的主事者是誰？",
+                    "phenomenon": "未明確說明合作方背景",
+                    "basis": "文件未提及合作方資歷",
+                    "suggested_action": "要求補充合作方資歷說明",
+                    "heading": None,
+                }
+            ]
+        },
+        "缺失型權責不清": {
+            "triggered": True,
+            "entries": [
+                {
+                    "question": "誰負責什麼決策？",
+                    "phenomenon": "未說明決策權限",
+                    "basis": "協議未明確權責分工",
+                    "suggested_action": "補充權責說明章節",
+                    "heading": "權責分工",
+                }
+            ]
+        }
+    }
+
+    result = render_veto_section(veto_results)
+
+    # 驗證各部分存在性
+    assert "## 不合作紅線檢查" in result
+    assert "> ⚠️ **驗證邊界**：" in result
+    assert "- ✅ **矛盾型資源不實**：未觸發" in result
+    assert "### 🚫 缺失型人不明" in result
+    assert "### 🚫 缺失型權責不清" in result
+    assert "「合作方的主事者是誰？」（相關片段：（無法定位到具體片段））" in result
+    assert "「誰負責什麼決策？」（相關片段：權責分工）" in result
+    assert "---" in result
+
+    # 驗證換行格式——splitlines() 不會為結尾的換行符另外產生一個空字串
+    # 元素，所以分隔線是最後一個元素，不是倒數第二個（實測驗證過，不是
+    # 憑印象推論字串 join/splitlines 的邊界行為）
+    lines = result.splitlines()
+    assert lines[-1] == "---", "結尾應為分隔線"
+
+
+# ---------------------------------------------------------------------------
+# check_deterministic()：批次F。截斷判斷用是否撞到 max_tokens 上限（門檻是
+# max_tokens - 8，含），不是猜結尾標點；completion_tokens 不是 int 時永遠
+# 不算撞上限；空白/空字串答案視為截斷；亂碼判斷：含「�」或連續同一字元
+# 10 次以上（9 次不算）。
+# ---------------------------------------------------------------------------
+
+def test_check_deterministic_token_cap_boundary():
+    # max_tokens=108 → 門檻是 100（含）
+    assert check_deterministic("test", 99, 108)["not_truncated"] is True
+    assert check_deterministic("test", 100, 108)["not_truncated"] is False
+    assert check_deterministic("test", 108, 108)["not_truncated"] is False
+
+
+@pytest.mark.parametrize("completion_tokens", ["200", None])
+def test_check_deterministic_non_int_tokens_never_hit_cap(completion_tokens):
+    assert check_deterministic("test", completion_tokens, 108)["not_truncated"] is True
+
+
+@pytest.mark.parametrize("answer", ["", "   \n\t"])
+def test_check_deterministic_empty_answer_is_truncated(answer):
+    # completion_tokens 遠低於門檻，確保判定只來自空白答案本身
+    assert check_deterministic("test", 10, 108)["not_truncated"] is True
+    assert check_deterministic(answer, 10, 108)["not_truncated"] is False
+
+
+def test_check_deterministic_replacement_char_is_garbled():
+    assert check_deterministic("a\ufffdb", 10, 108)["no_garbled"] is False
+
+
+def test_check_deterministic_repeat_run_boundary():
+    assert check_deterministic("x" + "a" * 9 + "y", 10, 108)["no_garbled"] is True
+    assert check_deterministic("x" + "a" * 10 + "y", 10, 108)["no_garbled"] is False
+
+
+def test_check_deterministic_pass_requires_both():
+    assert check_deterministic("正常回答", 10, 108)["deterministic_pass"] is True
+    assert check_deterministic("正常回答", 100, 108)["deterministic_pass"] is False
+    assert check_deterministic("正常\ufffd回答", 10, 108)["deterministic_pass"] is False
+
+
+# ---------------------------------------------------------------------------
+# load_scoring_template()：批次F。模板名稱打錯字要在讀模板階段直接死掉，不
+# 是跑到評分階段才發現；跟 verify_sources_exist() 的 typo 前置檢查同一個
+# 原則。用 tmp_path 建立真實檔案，不 mock 檔案系統；真實 scoring_templates.
+# json 最上層直接就是模板名稱，沒有額外的 "templates" 包裝層。
+# ---------------------------------------------------------------------------
+
+def _write_templates(tmp_path):
+    path = tmp_path / "scoring_templates.json"
+    path.write_text(json.dumps({
+        "九格": {"dimensions": [{"name": "A", "weight": 1.0}], "grade_bands": []},
+        "深科技": {"dimensions": [{"name": "B", "weight": 1.0}], "grade_bands": []},
+    }, ensure_ascii=False), encoding="utf-8")
+    return str(path)
+
+
+def test_load_scoring_template_returns_named_template(tmp_path):
+    path = _write_templates(tmp_path)
+    assert load_scoring_template(path, "深科技") == {
+        "dimensions": [{"name": "B", "weight": 1.0}], "grade_bands": [],
+    }
+
+
+def test_load_scoring_template_missing_file_dies(tmp_path, capsys):
+    missing = str(tmp_path / "nope.json")
+    with pytest.raises(SystemExit) as excinfo:
+        load_scoring_template(missing, "九格")
+    assert excinfo.value.code == 1
+    assert f"找不到評分模板設定檔：{missing}" in capsys.readouterr().err
+
+
+def test_load_scoring_template_unknown_name_dies_listing_available(tmp_path, capsys):
+    path = _write_templates(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        load_scoring_template(path, "九宮格")
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "評分模板 '九宮格' 不存在" in err
+    assert "['九格', '深科技']" in err
+
+
+# ---------------------------------------------------------------------------
+# apply_full_dd_report_defaults()：任務三。--full-dd-report 只補使用者
+# 沒有主動選擇的部分——已經明確指定 --detect-red-flags 或 --scoring-template
+# 時不覆蓋，不管使用者指定的是不是「九格」。用 SimpleNamespace 模擬
+# argparse.Namespace，不需要真的跑 argparse。
+# ---------------------------------------------------------------------------
+
+def test_apply_full_dd_report_defaults_fills_both_when_unset():
+    args = SimpleNamespace(full_dd_report=True, detect_red_flags=False, scoring_template=None)
+    apply_full_dd_report_defaults(args)
+    assert args.detect_red_flags is True
+    assert args.scoring_template == "九格"
+
+
+def test_apply_full_dd_report_defaults_does_not_override_explicit_scoring_template():
+    args = SimpleNamespace(full_dd_report=True, detect_red_flags=False, scoring_template="深科技")
+    apply_full_dd_report_defaults(args)
+    assert args.detect_red_flags is True
+    assert args.scoring_template == "深科技"
+
+
+def test_apply_full_dd_report_defaults_does_not_override_explicit_detect_red_flags():
+    # 已經是 True 時不該被重新賦值成別的東西（雖然結果一樣是 True，重點是
+    # 不誤觸發沒必要的自動套用邏輯，跟上一條測試同一個「不覆蓋」原則對稱）
+    args = SimpleNamespace(full_dd_report=True, detect_red_flags=True, scoring_template=None)
+    apply_full_dd_report_defaults(args)
+    assert args.detect_red_flags is True
+    assert args.scoring_template == "九格"
+
+
+def test_apply_full_dd_report_defaults_noop_when_flag_off():
+    args = SimpleNamespace(full_dd_report=False, detect_red_flags=False, scoring_template=None)
+    apply_full_dd_report_defaults(args)
+    assert args.detect_red_flags is False
+    assert args.scoring_template is None
+
+
+# ---------------------------------------------------------------------------
+# check_full_dd_report_tag_coverage()：任務三。純邏輯，檢查問題清單裡
+# 三種tag的覆蓋率，缺什麼就回傳對應提示——不是規則檢查，只是「這份清單
+# 可能沒有用滿DD報告四個章節」的非阻斷提醒。
+# ---------------------------------------------------------------------------
+
+def _q(dimension=None, veto=None, group=None):
+    return {"question": "Q", "group": group, "metric": None, "source": None,
+            "dimension": dimension, "veto": veto}
+
+
+def test_check_tag_coverage_all_missing_when_scoring_template_set():
+    args = SimpleNamespace(scoring_template="九格")
+    hints = check_full_dd_report_tag_coverage([_q()], args)
+    assert len(hints) == 3
+    assert any("dimension" in h for h in hints)
+    assert any("veto" in h for h in hints)
+    assert any("group" in h for h in hints)
+
+
+def test_check_tag_coverage_dimension_hint_absent_without_scoring_template():
+    # 沒開評分模板時，即使沒有 dimension 標記也不用提示——評分本來就沒開
+    args = SimpleNamespace(scoring_template=None)
+    hints = check_full_dd_report_tag_coverage([_q()], args)
+    assert not any("dimension" in h for h in hints)
+    assert any("veto" in h for h in hints)
+    assert any("group" in h for h in hints)
+
+
+def test_check_tag_coverage_all_present_gives_no_hints():
+    args = SimpleNamespace(scoring_template="九格")
+    questions = [_q(dimension="動機", veto="人不明", group="定價")]
+    assert check_full_dd_report_tag_coverage(questions, args) == []
+
+
+def test_check_tag_coverage_only_one_question_needs_the_tag():
+    # any()：清單裡只要有一題帶了某種標記就不提示，不用每題都標
+    args = SimpleNamespace(scoring_template="九格")
+    questions = [_q(), _q(dimension="動機", veto="人不明", group="定價")]
+    assert check_full_dd_report_tag_coverage(questions, args) == []

@@ -8,6 +8,10 @@
   ground truth,所以不用。
 - split_think() 的 4 個案例照它自己 docstring 列的 4 種已知情境寫:完整
   <think>...</think>、只有結尾 </think>、只有開頭沒結尾(截斷)、完全沒有標籤。
+- build_context()：驗證多筆hits的編號與換行連接、heading_path/body/text
+  欄位的預設值處理、hit完全缺payload時的容錯。body為空的案例直接比對
+  完整block內容，不是只檢查空字串是否為子字串（那樣不管body有沒有洩漏
+  多餘內容都會通過，等於沒測到）。
 """
 import os
 import sys
@@ -16,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 import pytest
 
-from rag_answer import detect_think_reason, split_think
+from rag_answer import build_context, detect_think_reason, split_think
 
 
 # 這 8 筆是 merge 前那次「8 題問答」的真實結果，見
@@ -85,3 +89,53 @@ def test_split_think_no_tags_at_all():
     visible, thinking = split_think("這是答案，完全沒有推理標籤")
     assert visible == "這是答案，完全沒有推理標籤"
     assert thinking == ""
+
+
+# ---------------------------------------------------------------------------
+# build_context()
+# ---------------------------------------------------------------------------
+
+def test_build_context_empty_hits():
+    assert build_context([]) == "", "空清單應返回空字串"
+
+
+@pytest.mark.parametrize("payload,expected_heading", [
+    ({"body": "content"}, "(無章節)"),
+    ({"heading_path": "章節1", "body": "content"}, "章節1"),
+    ({}, "(無章節)"),
+])
+def test_build_context_missing_heading_path(payload, expected_heading):
+    hits = [{"payload": payload}]
+    result = build_context(hits)
+    assert f"[文件片段 1] {expected_heading}" in result, "應使用預設heading"
+
+
+# body存在時使用body，否則用text，兩者都無時為空字串——後兩個 case 直接
+# 比對整條 block 的完整內容，不是只檢查空字串是不是 result 的子字串（空
+# 字串永遠是任何字串的子字串，那樣寫不管 body 是不是真的空的都會通過）。
+@pytest.mark.parametrize("payload,expected_block", [
+    ({"body": "body content"}, "[文件片段 1] (無章節)\nbody content"),
+    ({"text": "text content"}, "[文件片段 1] (無章節)\ntext content"),
+    ({"body": "", "text": ""}, "[文件片段 1] (無章節)\n"),
+    ({}, "[文件片段 1] (無章節)\n"),
+])
+def test_build_context_body_text_handling(payload, expected_block):
+    hits = [{"payload": payload}]
+    result = build_context(hits)
+    assert result == expected_block, "應正確處理body/text欄位，含body為空的情況"
+
+
+@pytest.mark.parametrize("hit_count", [1, 2, 3])
+def test_build_context_multiple_hits(hit_count):
+    hits = [{"payload": {}} for _ in range(hit_count)]
+    result = build_context(hits)
+    blocks = result.split("\n\n")
+    assert len(blocks) == hit_count, "應正確分割多個文件片段"
+    for i, block in enumerate(blocks, 1):
+        assert f"[文件片段 {i}]" in block, f"第{i}個片段應有正確編號"
+
+
+def test_build_context_missing_payload():
+    hits = [{}]
+    result = build_context(hits)
+    assert "[文件片段 1] (無章節)" in result, "無payload時應使用預設值"

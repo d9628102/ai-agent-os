@@ -27,6 +27,10 @@
 餵給生成代理時，不會把「直接寫字面標籤」這個寫法示範出去——實測過模型看到
 要輸出字面標籤時，會自己換成別的標籤（例如把 think 換成 x），產出語法正確
 但測錯東西的假案例。
+
+- main() 的孤立標籤重試控制流程（第一次孤立就重試一次、兩次都孤立就中止
+  不寫檔、第一次乾淨就只呼叫一次）：這三個情境是這份檔案新增的部分，補回
+  之前只用一次性腳本手動驗證過、沒有收進正式測試的案例
 """
 
 import os
@@ -126,3 +130,105 @@ def test_strip_returns_input_unchanged_when_no_valid_code(raw, description):
     """剝不出合法 Python 時原樣回傳（只 strip 前後空白），讓呼叫端的語法
     檢查去報錯——不要自己猜一個切法、產出半殘的草稿。"""
     assert strip_think_and_fence(raw) == raw.strip(), description
+
+
+# ---------------------------------------------------------------------------
+# main() 的孤立標籤重試控制流程：抓到孤立標籤要重新生成一次；兩次都有就
+# 中止、完全不寫草稿檔；第一次就乾淨的話只呼叫模型一次。用 monkeypatch
+# 假的 call_llm（不燒真的模型呼叫）跑一次完整的 main()，直接驗證呼叫
+# 次數、是否中止、草稿檔是否寫出/寫出的內容是否已經沒有孤立標籤。
+#
+# 這三個情境先前用一支一次性驗證腳本手動跑過一次、全部正確，但當時只有
+# find_orphan_think_tags() 的 8 個單元案例被收進這份檔案，控制流程本身
+# 的 3 個情境沒有——這裡補上，並補做原本沒有做過的反向驗證（mutation
+# testing）。
+# ---------------------------------------------------------------------------
+
+import test_generation_agent as _tga
+
+PAIRED_DRAFT = (
+    '"""測試"""\n'
+    'import pytest\n\n'
+    '@pytest.mark.parametrize("raw", [\n'
+    f'    "{OPEN}一些推理{CLOSE}\\n{{ ok }}",\n'
+    '])\n'
+    'def test_paired(raw):\n'
+    '    assert raw\n'
+)
+
+ORPHAN_DRAFT = (
+    '"""測試"""\n'
+    'import pytest\n\n'
+    '@pytest.mark.parametrize("raw", [\n'
+    f'    "{CLOSE}\\n{{ ok }}",\n'
+    '])\n'
+    'def test_orphan(raw):\n'
+    '    assert raw\n'
+)
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_FLOW_DRAFT_REL = "tests/_testgen_flow_DRAFT.py"
+_FLOW_DRAFT_FULL = os.path.join(_REPO_ROOT, _FLOW_DRAFT_REL)
+
+
+@pytest.fixture
+def cleanup_flow_draft():
+    yield
+    if os.path.exists(_FLOW_DRAFT_FULL):
+        os.remove(_FLOW_DRAFT_FULL)
+
+
+def _run_main_with_fake_outputs(monkeypatch, fake_outputs):
+    """用假的 call_llm 跑一次 main()，回傳 (是否中止, 呼叫次數, 草稿內容或None)。"""
+    calls = {"n": 0}
+
+    def fake_call_llm(messages, max_tokens=8192, timeout=300):
+        calls["n"] += 1
+        return fake_outputs[min(calls["n"] - 1, len(fake_outputs) - 1)]
+
+    monkeypatch.setattr(_tga, "call_llm", fake_call_llm)
+    monkeypatch.setattr(_tga, "run_pytest_on_draft", lambda *a, **k: (0, "(測試用：略過真的跑 pytest)"))
+    if os.path.exists(_FLOW_DRAFT_FULL):
+        os.remove(_FLOW_DRAFT_FULL)
+
+    monkeypatch.setattr(sys, "argv", [
+        "test_generation_agent.py",
+        "--target", "scripts/test_generation_agent.py:find_orphan_think_tags",
+        "--style-reference", "tests/test_scoring.py",
+        "--output", _FLOW_DRAFT_REL,
+        "--repo-root", _REPO_ROOT,
+    ])
+
+    died = False
+    try:
+        _tga.main()
+    except SystemExit:
+        died = True
+
+    content = None
+    if os.path.exists(_FLOW_DRAFT_FULL):
+        with open(_FLOW_DRAFT_FULL, "r", encoding="utf-8") as f:
+            content = f.read()
+    return died, calls["n"], content
+
+
+def test_main_retries_once_then_succeeds_on_clean_second_draft(monkeypatch, cleanup_flow_draft):
+    died, calls, content = _run_main_with_fake_outputs(monkeypatch, [ORPHAN_DRAFT, PAIRED_DRAFT])
+    assert died is False, "第二次生成乾淨，不該中止"
+    assert calls == 2, "第一次孤立要觸發剛好一次重新生成"
+    assert content is not None, "最終應該寫出草稿檔"
+    assert find_orphan_think_tags(content) == [], "寫出的草稿不該再有孤立標籤"
+
+
+def test_main_aborts_without_writing_draft_when_both_attempts_orphaned(monkeypatch, cleanup_flow_draft):
+    died, calls, content = _run_main_with_fake_outputs(monkeypatch, [ORPHAN_DRAFT, ORPHAN_DRAFT])
+    assert died is True, "兩次都孤立，人工審核不該花時間看這種機械性錯誤，要直接中止"
+    assert calls == 2, "應該剛好重試一次（不是無限重試）"
+    assert content is None, "中止時完全不該寫出草稿檔"
+
+
+def test_main_calls_model_only_once_when_first_draft_is_clean(monkeypatch, cleanup_flow_draft):
+    died, calls, content = _run_main_with_fake_outputs(monkeypatch, [PAIRED_DRAFT])
+    assert died is False
+    assert calls == 1, "第一次就乾淨時不該多花一次生成"
+    assert content is not None

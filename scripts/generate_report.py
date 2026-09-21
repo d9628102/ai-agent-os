@@ -858,6 +858,46 @@ def render_tag_table(questions) -> str:
     return "\n".join(lines)
 
 
+def check_full_dd_report_tag_coverage(questions, args):
+    """--full-dd-report 專用的非阻斷建議提示：檢查問題清單裡三種tag的
+    覆蓋率，缺什麼就提示，不擋流程。純粹是「這份清單可能沒有用滿DD報告
+    四個章節」的提醒，不是規則檢查——tag本來就是可選、獨立的，見
+    load_questions() docstring。純邏輯，不呼叫LLM。"""
+    hints = []
+    if args.scoring_template and not any(q.get("dimension") for q in questions):
+        hints.append(
+            "已啟用 --scoring-template，但問題清單裡沒有任何 `## dimension:` "
+            "標記——評分章節會是空的（沒有題目歸屬任何評分維度）"
+        )
+    if not any(q.get("veto") for q in questions):
+        hints.append(
+            "問題清單裡沒有任何 `## veto:` 標記——不會做不合作紅線檢查。"
+            "如果這份DD報告需要veto把關，記得標記相關題目"
+        )
+    if not any(q.get("group") for q in questions):
+        hints.append(
+            "問題清單裡沒有任何 `## group:` 標記——不會做跨題數字一致性"
+            "檢查。如果清單裡有多題問到同一個指標，標記可以抓出矛盾"
+        )
+    return hints
+
+
+def apply_full_dd_report_defaults(args):
+    """--full-dd-report 只補使用者沒有主動選擇的部分：已經明確指定
+    --detect-red-flags 或 --scoring-template 時不覆蓋。純邏輯，不做任何
+    I/O——原本直接寫在 main() 裡，抽出來是為了跟
+    check_full_dd_report_tag_coverage() 一樣可以離開真正的CLI/Qdrant/LLM
+    單獨驗證，不用整支程式真的跑起來才能測到這段行為。"""
+    if not args.full_dd_report:
+        return
+    if not args.detect_red_flags:
+        args.detect_red_flags = True
+        log("--full-dd-report：自動開啟 --detect-red-flags")
+    if not args.scoring_template:
+        args.scoring_template = "九格"
+        log("--full-dd-report：自動套用 --scoring-template 九格")
+
+
 def main():
     ap = argparse.ArgumentParser(description="批次跑 RAG 問答 + QA 把關，組成一份 Markdown 報告。")
     ap.add_argument("--questions", required=True, help="問題清單檔案，每行一題")
@@ -885,16 +925,26 @@ def main():
                      default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                           "data", "scoring_templates.json"),
                      help="評分模板設定檔路徑（預設 scripts/data/scoring_templates.json）")
+    ap.add_argument("--full-dd-report", action="store_true", default=False,
+                     help="一鍵開啟完整DD報告模式：自動補上 --detect-red-flags 跟"
+                          "--scoring-template 九格（已明確指定其中之一時不覆蓋），"
+                          "並在載入問題清單後檢查tag覆蓋率、印出非阻斷的建議提示。"
+                          "純便利包裝，不改變任何底層判斷邏輯")
     ap.add_argument("--dry-run", action="store_true", default=False,
                      help="只解析問題清單、印出每題的 source/group/metric/"
                           "dimension/veto 標記對照表，不跑檢索或生成，也不"
                           "產生報告——設計跨主題問題清單時先用這個自檢標記"
                           "有沒有正確延續/清除")
     args = ap.parse_args()
+    apply_full_dd_report_defaults(args)
 
     questions = load_questions(args.questions)
     if not questions:
         die(f"{args.questions} 裡沒有找到任何問題。")
+
+    if args.full_dd_report:
+        for hint in check_full_dd_report_tag_coverage(questions, args):
+            log(f"[建議] {hint}")
 
     if args.dry_run:
         print(render_tag_table(questions))

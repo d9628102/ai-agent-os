@@ -203,6 +203,65 @@ def find_orphan_think_tags(code: str):
     return orphans
 
 
+CONFIG_PATH_PATTERN = re.compile(r"[\w][\w\-./]*\.(?:json|yaml|yml)\b")
+
+_MAX_CONFIG_CHARS = 20000
+
+
+def find_referenced_config_files(repo_root: str, text: str):
+    """掃描函式原始碼（含 docstring）裡看起來像設定檔路徑的字串（結尾是
+    .json/.yaml/.yml 的相對路徑），解析成 repo 內真的存在的檔案。
+
+    用來在生成測試草稿前，把目標函式實際讀寫的設定檔真實內容自動附加進
+    生成請求——不能只靠人在 --hint 裡手動貼 schema。scoring_templates.json
+    的結構已經因為沒貼而被生成代理臆測出不相容的假結構三次（見
+    docs/rag-findings.md「虛構跟真實系統不相容的資料結構」），操作習慣層級
+    的提醒證明不可靠，這裡改成工具本身的行為，不再依賴人記得。
+
+    純字串掃描，不解析 AST——設定檔路徑常常只出現在 docstring 裡（例如
+    load_scoring_template() 本身不寫死路徑，是呼叫端傳進來的參數，但
+    docstring 裡明文寫了它讀的是哪個檔案），AST 抓不到 docstring 以外的
+    註解或字串常值組合，字串掃描反而更直接、更不會漏。
+
+    回傳 [(相對路徑, 絕對路徑), ...]，依出現順序、去重；不存在的路徑（誤判
+    成路徑格式的字串）直接濾掉，不回報。"""
+    seen = set()
+    found = []
+    for m in CONFIG_PATH_PATTERN.finditer(text):
+        candidate = m.group(0)
+        if candidate in seen:
+            continue
+        full = os.path.join(repo_root, candidate)
+        if os.path.isfile(full):
+            seen.add(candidate)
+            found.append((candidate, full))
+    return found
+
+
+def build_config_reference_block(referenced_configs):
+    """把偵測到的設定檔真實內容組成要附加進 user_content 的文字區塊。
+    單一檔案超過 _MAX_CONFIG_CHARS 就截斷並明確標註，避免罕見的巨大設定檔
+    把生成請求撐爆——目前實際遇到的設定檔（scoring_templates.json 等）都
+    遠小於這個上限，這裡只是防呆。"""
+    if not referenced_configs:
+        return ""
+    parts = []
+    for rel_path, full_path in referenced_configs:
+        with open(full_path, "r", encoding="utf-8") as f:
+            body = f.read()
+        truncated_note = ""
+        if len(body) > _MAX_CONFIG_CHARS:
+            body = body[:_MAX_CONFIG_CHARS]
+            truncated_note = "\n（檔案過大，已截斷——若測試需要更完整內容請自行擴充 --hint）"
+        parts.append(f"# {rel_path} 的真實內容{truncated_note}\n{body}")
+    return (
+        "\n\n---\n\n以下是目標函式原始碼（含 docstring）裡提到的設定檔的"
+        "真實內容，不是虛構範例。生成測試時任何用到這份設定檔結構的 mock/"
+        "測試資料都必須跟這裡的真實 schema 一致，不能自己發明不相容的結構：\n\n"
+        "```\n" + "\n\n".join(parts) + "\n```"
+    )
+
+
 def generate_draft(messages, max_tokens=8192):
     """呼叫模型生成一份草稿、剝殼、檢查語法，回傳草稿原始碼。語法錯誤直接
     中止（維持原本行為）——抽成獨立函式是為了讓孤立 think 標籤的機械檢查
@@ -251,11 +310,21 @@ def main():
         style_reference = f.read()
 
     function_blocks = []
+    referenced_configs = []
+    seen_config_paths = set()
     for spec in args.target:
         file_path, func_name = parse_target(spec)
         log(f"抓取 {file_path}:{func_name} 的原始碼...")
         source = extract_function_source(repo_root, file_path, func_name)
         function_blocks.append(f"# 來自 {file_path} 的 {func_name}()\n{source}")
+        for rel_path, full_path in find_referenced_config_files(repo_root, source):
+            if rel_path not in seen_config_paths:
+                seen_config_paths.add(rel_path)
+                referenced_configs.append((rel_path, full_path))
+
+    if referenced_configs:
+        log(f"偵測到目標函式提及設定檔路徑：{[r for r, _ in referenced_configs]}，"
+            f"自動讀取真實內容附加進生成請求（不需要在 --hint 裡手動貼）...")
 
     hints_text = "\n".join(f"- {h}" for h in args.hint) if args.hint else "（沒有額外指定，自行判斷合理的邊界情況）"
 
@@ -264,6 +333,7 @@ def main():
         f"```python\n{style_reference}\n```\n\n"
         f"---\n\n要測試的函式：\n\n```python\n" + "\n\n".join(function_blocks) + "\n```\n\n"
         f"---\n\n這次一定要覆蓋的邊界情況：\n{hints_text}"
+        f"{build_config_reference_block(referenced_configs)}"
     )
 
     messages = [

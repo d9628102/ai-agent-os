@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import pytest
 
 from scoring import (
+    build_dimension_bundle,
     compute_weighted_total,
     lookup_grade,
     parse_scoring_response,
@@ -229,3 +230,111 @@ def test_json_output_reminder_wired_into_all_three_prompts():
     assert JSON_OUTPUT_REMINDER in SCORING_SYSTEM_PROMPT, (
         "scoring.SCORING_SYSTEM_PROMPT 沒有接上 JSON_OUTPUT_REMINDER"
     )
+
+
+# ---------------------------------------------------------------------------
+# build_dimension_bundle()：批次F。純邏輯組字串——紅旗標註、數字一致性檢查
+# 衝突標記（僅列 found=true 的值）、同一份 bundle 內同一個衝突指標只掛在
+# 第一個命中的題目底下（intentional 組內去重，docstring明寫），但跨呼叫
+# （不同維度各自呼叫一次）重複出現同一個衝突是預期行為，不能被誤修成全域
+# 去重。status 只認 "conflict"（"consistent"/"insufficient" 都不掛）。
+# ---------------------------------------------------------------------------
+
+def _consistency_result(metric, pairs, status="conflict"):
+    return {
+        "metric": metric,
+        "status": status,
+        "entries": [
+            {"question": q, "extraction": {"raw_value": v, "found": found}}
+            for q, v, found in pairs
+        ],
+    }
+
+
+def test_build_dimension_bundle_plain_entry():
+    entries = [{"question": "Q1", "answer": "A1"}]
+    assert build_dimension_bundle(entries, []) == "問題：Q1\n回答：A1"
+
+
+def test_build_dimension_bundle_detection_not_red_flag():
+    entries = [{"question": "Q1", "answer": "A1", "detection": {"is_red_flag": False}}]
+    assert build_dimension_bundle(entries, []) == "問題：Q1\n回答：A1"
+
+
+def test_build_dimension_bundle_red_flag_line():
+    entries = [{"question": "Q1", "answer": "A1", "detection": {
+        "is_red_flag": True,
+        "title": "營收認列異常",
+        "severity": "高",
+        "phenomenon": "兩份文件營收數字不同",
+    }}]
+    assert build_dimension_bundle(entries, []) == (
+        "問題：Q1\n回答：A1\n"
+        "這題被判定為紅旗：營收認列異常（嚴重度：高）——兩份文件營收數字不同"
+    )
+
+
+def test_build_dimension_bundle_conflict_line():
+    entries = [{"question": "Q1", "answer": "A1", "group_id": "營收"}]
+    results = [_consistency_result("營收", [("Q1", "100", True), ("Q2", "200", True)])]
+    assert build_dimension_bundle(entries, results) == (
+        "問題：Q1\n回答：A1\n"
+        "這題涉及數字一致性檢查衝突（指標「營收」）：「Q1」→ 100；「Q2」→ 200"
+    )
+
+
+def test_build_dimension_bundle_conflict_line_skips_not_found_values():
+    entries = [{"question": "Q1", "answer": "A1", "group_id": "營收"}]
+    results = [_consistency_result("營收", [
+        ("Q1", "100", True),
+        ("Q2", None, False),
+        ("Q3", "300", True),
+    ])]
+    assert build_dimension_bundle(entries, results) == (
+        "問題：Q1\n回答：A1\n"
+        "這題涉及數字一致性檢查衝突（指標「營收」）：「Q1」→ 100；「Q3」→ 300"
+    )
+
+
+# 同一份 bundle 內，同一個衝突只掛在第一個命中的題目底下——刻意設計，不是漏掛
+def test_build_dimension_bundle_same_conflict_attached_once_within_bundle():
+    entries = [
+        {"question": "Q1", "answer": "A1", "group_id": "營收"},
+        {"question": "Q2", "answer": "A2", "group_id": "營收"},
+    ]
+    results = [_consistency_result("營收", [("Q1", "100", True), ("Q2", "200", True)])]
+    assert build_dimension_bundle(entries, results) == (
+        "問題：Q1\n回答：A1\n"
+        "這題涉及數字一致性檢查衝突（指標「營收」）：「Q1」→ 100；「Q2」→ 200"
+        "\n\n---\n\n"
+        "問題：Q2\n回答：A2"
+    )
+
+
+# 跨維度（不同次呼叫）重複出現同一個衝突是 docstring 明寫的預期行為，不能被「去重」掉
+def test_build_dimension_bundle_same_conflict_repeats_across_calls():
+    results = [_consistency_result("營收", [("Q1", "100", True), ("Q2", "200", True)])]
+    line = "這題涉及數字一致性檢查衝突（指標「營收」）：「Q1」→ 100；「Q2」→ 200"
+    first = build_dimension_bundle([{"question": "Q1", "answer": "A1", "group_id": "營收"}], results)
+    second = build_dimension_bundle([{"question": "Q2", "answer": "A2", "group_id": "營收"}], results)
+    assert line in first
+    assert line in second
+
+
+@pytest.mark.parametrize("status", ["consistent", "insufficient"])
+def test_build_dimension_bundle_non_conflict_status_ignored(status):
+    entries = [{"question": "Q1", "answer": "A1", "group_id": "營收"}]
+    results = [_consistency_result("營收", [("Q1", "100", True), ("Q2", "100", True)], status=status)]
+    assert build_dimension_bundle(entries, results) == "問題：Q1\n回答：A1"
+
+
+def test_build_dimension_bundle_conflict_not_involving_question_ignored():
+    entries = [{"question": "Q1", "answer": "A1", "group_id": "營收"}]
+    results = [_consistency_result("營收", [("Q2", "200", True), ("Q3", "300", True)])]
+    assert build_dimension_bundle(entries, results) == "問題：Q1\n回答：A1"
+
+
+def test_build_dimension_bundle_no_group_id_ignores_conflicts():
+    entries = [{"question": "Q1", "answer": "A1"}]
+    results = [_consistency_result("營收", [("Q1", "100", True), ("Q2", "200", True)])]
+    assert build_dimension_bundle(entries, results) == "問題：Q1\n回答：A1"

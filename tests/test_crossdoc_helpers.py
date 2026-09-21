@@ -5,6 +5,8 @@
   只濾掉 falsy 值——這是刻意的：呼叫端如果傳進未 strip 的 source，寧可讓
   查詢明確查不到、报錯提示，也不要靜默把使用者的參數丟掉當作沒指定）
 - missing_sources()：空字典、全存在、混合存在、全不存在
+- source_filter()：驗證回傳的 Qdrant filter 結構、不同 source 值反映在
+  對應的輸出裡（不是寫死的固定字典）
 - 皆依照現有測試檔案的參數化寫法與斷言風格
 """
 
@@ -15,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 import pytest
 
-from rag_common import distinct_sources, missing_sources
+from rag_common import distinct_sources, missing_sources, source_filter
 from generate_report import parse_source_tag
 
 
@@ -121,3 +123,25 @@ def test_missing_sources_mixed(source_exists, expected):
 ])
 def test_missing_sources_all_missing(source_exists, expected):
     assert missing_sources(source_exists) == expected
+
+
+# source_filter()：回傳的dict結構必須符合預期格式
+@pytest.mark.parametrize("source,expected", [
+    ("doc1", {"must": [{"key": "source", "match": {"value": "doc1"}}]}),
+    ("example", {"must": [{"key": "source", "match": {"value": "example"}}]}),
+])
+def test_source_filter_structure(source, expected):
+    assert source_filter(source) == expected, "filter結構應符合預期格式"
+
+
+# source_filter()：不同source字串產生對應的filter值，不是寫死的固定字典
+@pytest.mark.parametrize("source1,source2", [
+    ("doc1", "doc2"),
+    ("test", "example"),
+    ("a", "b"),
+])
+def test_source_filter_different_sources(source1, source2):
+    filter1 = source_filter(source1)
+    filter2 = source_filter(source2)
+    assert filter1["must"][0]["match"]["value"] == source1, "filter值應反映source1"
+    assert filter2["must"][0]["match"]["value"] == source2, "filter值應反映source2"

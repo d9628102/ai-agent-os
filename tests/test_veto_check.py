@@ -3,6 +3,9 @@
 - parse_veto_response()：驗證 JSON 解析、欄位完整性檢查、code fence/配對 think 標籤剝殼、錯誤處理
 - summarize_veto_results()：驗證規則分組邏輯、觸發狀態聚合、固定順序輸出、僅包含實際測試過的規則
 - build_veto_banner_line()：驗證空結果處理、觸發規則顯示、未觸發狀態顯示
+- _build_veto_system_prompt()：驗證五條規則各自組出正確的模式區塊（矛盾型/
+  缺失型 wiring，逐條核對不是只測一矛盾一缺失就假設其他都對）、規則名稱與
+  描述文字、JSON_OUTPUT_REMINDER 共用防線；不存在的規則名稱要拋出 KeyError
 """
 
 import json
@@ -13,8 +16,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 import pytest
 
-from veto_check import VETO_RULES, parse_veto_response, summarize_veto_results
+from veto_check import (
+    VETO_RULES,
+    _ABSENCE_MODE_BLOCK,
+    _CONTRADICTION_MODE_BLOCK,
+    _build_veto_system_prompt,
+    parse_veto_response,
+    summarize_veto_results,
+)
 from generate_report import build_veto_banner_line
+from rag_common import JSON_OUTPUT_REMINDER
 
 # parse_veto_response()：合法JSON(is_veto_triggered=True且欄位完整)時,回傳完整結果,parse_error=None
 @pytest.mark.parametrize("raw,description", [
@@ -147,3 +158,28 @@ def test_build_veto_banner_line_triggered(veto_results, expected):
 ])
 def test_build_veto_banner_line_not_triggered(veto_results):
     assert build_veto_banner_line(veto_results) == "**不合作紅線**：✅ 未觸發"
+
+
+# _build_veto_system_prompt()：逐條驗證五條規則各自組出正確的模式區塊——
+# 不能只測一條矛盾型加一條缺失型就假設其他都對，這是這個函式歷史上最
+# 容易在編輯時不小心弄反的部分。直接 import 真正的模組常數逐段比對，不
+# 自己重寫一份同名替代品（跟 tests/test_code_review_helpers.py 記錄的
+# shadow 定義假陽性是同一個要避免的陷阱）。
+@pytest.mark.parametrize("rule_name, expected_mode_block", [
+    ("資源不實", _CONTRADICTION_MODE_BLOCK),
+    ("人不明", _ABSENCE_MODE_BLOCK),
+    ("權責不清", _ABSENCE_MODE_BLOCK),
+    ("利益不明", _ABSENCE_MODE_BLOCK),
+    ("風險不揭露", _ABSENCE_MODE_BLOCK),
+])
+def test_build_veto_system_prompt_rule_coverage(rule_name, expected_mode_block):
+    prompt = _build_veto_system_prompt(rule_name)
+    assert rule_name in prompt, f"提示應包含規則名稱 {rule_name}"
+    assert VETO_RULES[rule_name]["description"] in prompt, f"提示應包含規則描述 {VETO_RULES[rule_name]['description']}"
+    assert expected_mode_block in prompt, f"提示應包含正確的模式塊 {expected_mode_block}"
+    assert JSON_OUTPUT_REMINDER in prompt, "提示應包含 JSON_OUTPUT_REMINDER"
+
+
+def test_build_veto_system_prompt_invalid_rule():
+    with pytest.raises(KeyError):
+        _build_veto_system_prompt("invalid_rule")

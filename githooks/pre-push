@@ -52,6 +52,7 @@ declare -A TEST_TO_LOGIC=(
   ["tests/test_scoring.py"]="scripts/scoring.py"
   ["tests/test_veto_check.py"]="scripts/veto_check.py"
   ["tests/test_testgen_helpers.py"]="scripts/test_generation_agent.py"
+  ["tests/test_code_review_helpers.py"]="scripts/code_review_agent.py"
 )
 
 run_pytest() {
