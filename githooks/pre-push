@@ -53,6 +53,9 @@ declare -A TEST_TO_LOGIC=(
   ["tests/test_veto_check.py"]="scripts/veto_check.py"
   ["tests/test_testgen_helpers.py"]="scripts/test_generation_agent.py"
   ["tests/test_code_review_helpers.py"]="scripts/code_review_agent.py"
+  ["tests/test_marketing_faithfulness.py"]="scripts/marketing_faithfulness.py"
+  ["tests/test_marketing_tone_score.py"]="scripts/marketing_tone_score.py"
+  ["tests/test_generate_marketing_copy.py"]="scripts/generate_marketing_copy.py"
 )
 
 run_pytest() {

@@ -1,0 +1,17 @@
+{
+  "重點條列型": {
+    "description": "標題+3-5條重點條列+CTA，適合快速瀏覽的產品/服務介紹",
+    "css": ".mc-wrap{max-width:720px;margin:0 auto;padding:48px 24px;font-family:-apple-system,'Noto Sans TC',sans-serif;color:#1a1a1a;line-height:1.7}.mc-title{font-size:32px;font-weight:700;margin:0 0 24px}.mc-bullets{list-style:none;padding:0;margin:0 0 32px}.mc-bullets li{padding:16px 0 16px 32px;border-bottom:1px solid #e5e5e5;position:relative}.mc-bullets li::before{content:'\\2713';position:absolute;left:0;color:#2563eb;font-weight:700}.mc-cta{display:inline-block;padding:14px 32px;background:#2563eb;color:#fff;border-radius:8px;text-decoration:none;font-weight:600}",
+    "html_template": "<!DOCTYPE html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><title>{title}</title><style>{css}</style></head><body><div class=\"mc-wrap\"><h1 class=\"mc-title\">{title}</h1><ul class=\"mc-bullets\">{bullets_html}</ul><a class=\"mc-cta\" href=\"#\">{cta}</a></div></body></html>"
+  },
+  "故事敘述型": {
+    "description": "標題+敘事段落(緣起/挑戰/解方)+CTA，適合強調脈絡與轉變的品牌故事",
+    "css": ".mc-wrap{max-width:680px;margin:0 auto;padding:48px 24px;font-family:-apple-system,'Noto Sans TC',sans-serif;color:#1a1a1a;line-height:1.9}.mc-title{font-size:30px;font-weight:700;margin:0 0 28px}.mc-story p{margin:0 0 20px;font-size:17px}.mc-cta{display:inline-block;margin-top:12px;padding:14px 32px;background:#0f766e;color:#fff;border-radius:8px;text-decoration:none;font-weight:600}",
+    "html_template": "<!DOCTYPE html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><title>{title}</title><style>{css}</style></head><body><div class=\"mc-wrap\"><h1 class=\"mc-title\">{title}</h1><div class=\"mc-story\">{story_html}</div><a class=\"mc-cta\" href=\"#\">{cta}</a></div></body></html>"
+  },
+  "數據導向型": {
+    "description": "標題+關鍵數字方塊(icon+數字+說明)+補充段落+CTA，適合用具體數據支撐賣點",
+    "css": ".mc-wrap{max-width:760px;margin:0 auto;padding:48px 24px;font-family:-apple-system,'Noto Sans TC',sans-serif;color:#1a1a1a;line-height:1.7}.mc-title{font-size:32px;font-weight:700;margin:0 0 24px}.mc-stats{display:flex;flex-wrap:wrap;gap:16px;margin:0 0 32px}.mc-stat{flex:1 1 160px;padding:20px;background:#f8fafc;border-radius:12px;text-align:center}.mc-stat-num{font-size:28px;font-weight:700;color:#7c3aed}.mc-stat-label{font-size:13px;color:#555;margin-top:6px}.mc-body p{margin:0 0 16px}.mc-cta{display:inline-block;margin-top:12px;padding:14px 32px;background:#7c3aed;color:#fff;border-radius:8px;text-decoration:none;font-weight:600}",
+    "html_template": "<!DOCTYPE html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"><title>{title}</title><style>{css}</style></head><body><div class=\"mc-wrap\"><h1 class=\"mc-title\">{title}</h1><div class=\"mc-stats\">{stats_html}</div><div class=\"mc-body\">{body_html}</div><a class=\"mc-cta\" href=\"#\">{cta}</a></div></body></html>"
+  }
+}
