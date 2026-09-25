@@ -218,6 +218,60 @@ printf '%s' 'HF_TOKEN=hf_你的真實token' > ~/.config/gx10-llm/env
 chmod 600 ~/.config/gx10-llm/env
 ```
 
+## 8. MemAvailable 可能高估約 8 GiB,真正能不靠 swap 取得的記憶體比較少
+
+**狀態**:已記錄,尚未追查。
+
+**現象**:Qwen-Image-2.1 評估(見
+[`qwen-image-eval-summary.md`](qwen-image-eval-summary.md))第二晚結束後
+(2026-09-26 01:03),`/proc/meminfo` 顯示:
+
+| 欄位 | 數值 |
+|---|---|
+| MemAvailable | 25.1 GiB |
+| MemFree | 14.0 GiB |
+| Cached | 2.7 GiB |
+| SReclaimable | 0.5 GiB |
+| AnonPages | 3.9 GiB |
+
+MemFree + Cached + SReclaimable 約 **17 GiB**,比 MemAvailable 少約 **8 GiB**,
+差額的來源還沒查清楚。另外 `free` 顯示 used 約 96 GiB,但 AnonPages 只有
+3.9 GiB,大部分是 vLLM 透過驅動預先保留的統一記憶體(見問題 6),不算在
+一般的匿名頁裡。
+
+**影響**:兩晚的評估都是 swap 門檻(增長 > 4 GiB)先觸發,MemAvailable
+門檻(< 4 GiB)從沒接近過,最低還有 10.6 / 13.87 GiB。以 MemAvailable 規劃
+記憶體,可能會高估能用的空間;而且在 page cache 很少時,kernel 會直接把
+vLLM、n8n 的記憶體換出到 swap,即使 MemAvailable 看起來還很充裕。
+
+**規劃時的做法**(追查前的保守做法):
+
+- 估算可用空間時看 MemFree + Cached + SReclaimable,不要只看 MemAvailable。
+- 監控或保護門檻要同時看 swap 增長,不能只看 MemAvailable。
+- 這只是一次量測,追查時要在不同負載下多量幾次,並確認差額是不是跟 GPU
+  驅動的保留記憶體有關。
+
+## 9. Qwen-Image 評估容器出現 `Unable to import torchao Tensor objects` 警告
+
+**狀態**:已記錄,影響未確認,尚未追查。
+
+**現象**:評估容器(`qwen-image-eval-noncommercial:26.08`,基底 NGC PyTorch
+26.08,torchao 用映像內建的版本)啟動時,log 有一行:
+
+```
+Unable to import `torchao` Tensor objects. This may affect loading checkpoints serialized with `torchao`
+```
+
+**可能的影響**:Unsloth FP8 transformer 權重是用 torchao Float8Tensor 格式
+序列化的,評估腳本用 torchao 的 `unflatten_tensor_state_dict` 還原。建映像
+時的 smoke test 確認過 torchao Float8 可用、零記憶體的 key/形狀檢查也通過,
+但這個警告來自 diffusers/transformers 的載入路徑,兩者差異沒查。兩晚評估都
+沒走到 transformer 載入就停止,所以**沒有實際驗證過** FP8 transformer 能
+正確還原。
+
+**未來重新評估前**:先查警告來自哪個套件、哪個 import 失敗,再確認
+transformer 的 FP8 權重還原結果正確。
+
 ## 相關檔案
 
 - 建置腳本:[`scripts/gx10-vllm-setup.sh`](../scripts/gx10-vllm-setup.sh)
@@ -227,3 +281,5 @@ chmod 600 ~/.config/gx10-llm/env
   + [`scripts/rag_smoke_test.py`](../scripts/rag_smoke_test.py)
   — Qdrant + BGE-M3 embedding(`--runner pooling`,對應問題 5)+
   collection 建立/寫入/語意搜尋/持久化驗證(對應本文件問題 4、6)。
+- Qwen-Image-2.1 評估摘要:[`qwen-image-eval-summary.md`](qwen-image-eval-summary.md)
+  (對應本文件問題 8、9;完整原始資料在 GX10 的 eval 目錄,不進版控)。
