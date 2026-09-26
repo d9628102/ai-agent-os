@@ -257,6 +257,24 @@ def test_guard_e_real_quote_or_narrative_passes(evidence):
     assert apply_deterministic_guards([c], SOURCE) == [c]
 
 
+# Guard E：引文或來源任一邊帶 Markdown 粗體 `**` 時，逐字相同的引用不能被誤判成捏造
+# （共用的 _norm_for_quote() 原本沒有去掉 `*`，任務二驗證時抓到這個誤擋）
+@pytest.mark.parametrize("evidence", [
+    "文件片段1提到「**AI 可以每天完成數萬個決策**」",
+    "文件片段1：AI 可以每天完成**數萬個決策**",
+])
+def test_guard_e_markdown_bold_in_evidence_passes(evidence):
+    c = _fact("每天完成數萬個決策", evidence=evidence)
+    assert apply_deterministic_guards([c], SOURCE) == [c]
+
+
+def test_guard_e_markdown_bold_in_source_passes():
+    source = SOURCE.replace("AI 可以每天完成數萬個決策", "AI 可以每天完成**數萬個決策**")
+    assert source != SOURCE
+    c = _fact("每天完成數萬個決策", evidence="文件片段1：AI 可以每天完成數萬個決策")
+    assert apply_deterministic_guards([c], source) == [c]
+
+
 def test_cited_segments_extracts_quotes_and_label_citations():
     # 引號內至少兩個字才算引文（避免把零星的引號當成引用）
     ev = "文件片段1：甲甲，對應文案；文件片段2提到「乙乙」；文件3的描述「丙」"

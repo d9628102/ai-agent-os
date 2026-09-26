@@ -225,11 +225,11 @@ def test_load_questions_clear_syntax_is_independent_per_marker(tmp_path):
     questions = load_questions(str(path))
     assert questions[0] == {
         "question": "問題1", "group": "G", "metric": "指標",
-        "source": None, "dimension": "信用", "veto": "資源不實",
+        "source": None, "dimension": "信用", "veto": "資源不實", "gate": None,
     }
     assert questions[1] == {
         "question": "問題2", "group": "G", "metric": "指標",
-        "source": None, "dimension": None, "veto": "資源不實",
+        "source": None, "dimension": None, "veto": "資源不實", "gate": None,
     }
 
 
@@ -865,20 +865,37 @@ def test_check_deterministic_pass_requires_both():
 # json 最上層直接就是模板名稱，沒有額外的 "templates" 包裝層。
 # ---------------------------------------------------------------------------
 
+# load_scoring_template() 讀到模板後會跑 validate_scoring_template()，所以
+# 假設定檔必須是合法的模板：原本的假設定檔（dimensions 是清單、grade_bands
+# 是空的）在加入設定檢查後本來就不合法，這裡刻意換成兩種評分制度各一個
+# 最小的合法模板，讓 diff 看得出這是跟著設定檢查一起的預期變更。
+_VALID_NUMERIC_TEMPLATE = {
+    "dimensions": {"A": 1},
+    "max_score_per_dimension": 5,
+    "grade_bands": [{"min": 0, "grade": "E", "label": "L"}],
+}
+_VALID_LETTER_TEMPLATE = {
+    "scale_type": "letter",
+    "display_name": "測試字母模板",
+    "grade_scale": ["A", "B"],
+    "below_scale_label": "低於 B",
+    "overall": "manual",
+    "dimensions": {"B": {"definition": "這個維度看什麼"}},
+}
+
+
 def _write_templates(tmp_path):
     path = tmp_path / "scoring_templates.json"
     path.write_text(json.dumps({
-        "九格": {"dimensions": [{"name": "A", "weight": 1.0}], "grade_bands": []},
-        "深科技": {"dimensions": [{"name": "B", "weight": 1.0}], "grade_bands": []},
+        "九格": _VALID_NUMERIC_TEMPLATE,
+        "深科技": _VALID_LETTER_TEMPLATE,
     }, ensure_ascii=False), encoding="utf-8")
     return str(path)
 
 
 def test_load_scoring_template_returns_named_template(tmp_path):
     path = _write_templates(tmp_path)
-    assert load_scoring_template(path, "深科技") == {
-        "dimensions": [{"name": "B", "weight": 1.0}], "grade_bands": [],
-    }
+    assert load_scoring_template(path, "深科技") == _VALID_LETTER_TEMPLATE
 
 
 def test_load_scoring_template_missing_file_dies(tmp_path, capsys):

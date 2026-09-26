@@ -261,7 +261,12 @@ _SUPERLATIVE_RE = re.compile(
 _QUOTED_RE = re.compile(r"[「『“\"]([^」』”\"]{2,})[」』”\"]")
 _CITED_AFTER_LABEL_RE = re.compile(r"^文件(?:片段)?\s*\d+\s*[：:]\s*([^，,。]+)")
 _EVIDENCE_SPLIT_RE = re.compile(r"[；;\n]|(?=文件(?:片段)?\s*\d+)")
-_QUOTE_NORMALIZE_RE = re.compile(r"[\s「」『』“”\"'‘’（）()。，、：:；;.™]")
+# `*` 是 Markdown 的粗體/斜體標記：來源或引文任一邊帶了 `**…**`，逐字相同的
+# 引用也會比對失敗。任務二（深科技評分）驗證時抓到：RAG 答案寫成
+# `為 **預測值（projected over 2 stages）**`，模型逐字引用「為 預測值（…）」
+# 卻被判成找不到，技術差異化三次評分全部被誤擋。行銷文案 Guard E 共用同一個
+# 正規化，一併修正。
+_QUOTE_NORMALIZE_RE = re.compile(r"[\s「」『』“”\"'‘’（）()。，、：:；;.™*]")
 
 
 def _norm_for_quote(text: str) -> str:

@@ -125,14 +125,58 @@ _ABSENCE_MODE_BLOCK = (
 )
 
 
-def _build_veto_system_prompt(rule_name: str) -> str:
-    rule = VETO_RULES[rule_name]
-    mode_block = _CONTRADICTION_MODE_BLOCK if rule["mode"] == "矛盾" else _ABSENCE_MODE_BLOCK
+# 兩個模式區塊裡「建議」欄位的前提句——五不合作的後果是「建議不合作」。
+# 模板自帶的 veto 規則（例如深科技模板的 Gate 3）後果不一樣（「完成智財
+# 歸屬確認前不可投資」），只替換這兩句，模式區塊其餘判斷邏輯完全沿用，
+# 不另起一套。
+_DEFAULT_ACTION_CLAUSES = {
+    "矛盾": "以「建議不合作」為前提，具體寫出除非對方能提供/證明什麼，否則維持不合作的建議",
+    "缺失": "以「建議不合作」為前提，具體寫出除非對方能補充/揭露什麼，否則維持不合作的建議",
+}
+
+
+def _mode_block_with_consequence(mode: str, consequence: str) -> str:
+    """回傳把「建議」前提句換成指定後果的模式區塊。原句找不到時丟錯，
+    不默默送出一個還寫著「建議不合作」的 prompt——模式區塊之後被改寫、
+    前提句對不上時，要在這裡立刻炸出來。"""
+    block = _CONTRADICTION_MODE_BLOCK if mode == "矛盾" else _ABSENCE_MODE_BLOCK
+    clause = _DEFAULT_ACTION_CLAUSES[mode]
+    if clause not in block:
+        raise ValueError(f"{mode}型模式區塊裡找不到預設的建議前提句，無法替換成「{consequence}」")
+    verb = "提供/證明" if mode == "矛盾" else "補充/揭露"
+    return block.replace(
+        clause, f"以「{consequence}」為前提，具體寫出除非對方能{verb}什麼，否則維持「{consequence}」的建議",
+    )
+
+
+def _build_veto_system_prompt(rule_name: str, rules: dict = None) -> str:
+    """rules 是 None 時用五不合作（VETO_RULES），組出的 prompt 跟加入模板
+    規則之前逐字相同。rules 是模板自帶的規則（深科技的 Gate 3）時，改用
+    規則自己的 source_label／原文判準／後果，判斷邏輯（矛盾型/缺失型模式
+    區塊）照舊。"""
+    if rules is None:
+        rule = VETO_RULES[rule_name]
+        mode_block = _CONTRADICTION_MODE_BLOCK if rule["mode"] == "矛盾" else _ABSENCE_MODE_BLOCK
+        return (
+            "你是嚴謹的盡職調查分析師。你會看到一則問答的問題、系統回答，以及"
+            "檢索到的文件片段全文。你的任務是判斷這一題的內容有沒有觸發"
+            "《PSF六壬合夥生態系統》第十四節「五不合作」裡的「"
+            f"{rule_name}」這一條——定義是「{rule['description']}」。\n"
+            f"{mode_block}\n"
+            f"{JSON_OUTPUT_REMINDER}\n"
+            f"{_JSON_SCHEMA_BLOCK}"
+        )
+
+    rule = rules[rule_name]
+    mode_block = _mode_block_with_consequence(rule["mode"], rule["consequence"])
+    verbatim = rule.get("criterion_verbatim")
+    verbatim_line = (f"原文判準（出自範例案子，公司名稱以本案為準）：「{verbatim}」\n"
+                     if verbatim else "")
     return (
         "你是嚴謹的盡職調查分析師。你會看到一則問答的問題、系統回答，以及"
         "檢索到的文件片段全文。你的任務是判斷這一題的內容有沒有觸發"
-        "《PSF六壬合夥生態系統》第十四節「五不合作」裡的「"
-        f"{rule_name}」這一條——定義是「{rule['description']}」。\n"
+        f"{rule['source_label']}的「{rule_name}」這一條——定義是「{rule['description']}」。\n"
+        f"{verbatim_line}"
         f"{mode_block}\n"
         f"{JSON_OUTPUT_REMINDER}\n"
         f"{_JSON_SCHEMA_BLOCK}"
@@ -192,13 +236,15 @@ def parse_veto_response(raw: str) -> dict:
     }
 
 
-def detect_veto(rule_name, question, answer, context, chat_url, chat_model, timeout=180):
+def detect_veto(rule_name, question, answer, context, chat_url, chat_model, timeout=180,
+                rules=None):
     """對一題的回答＋檢索片段全文，判斷是否觸發指定的veto規則。永遠回傳
     一個結構一致的 dict（含 "rule" 欄位），不拋例外。rule_name 必須是
     VETO_RULES 裡的合法規則名稱——呼叫端（generate_report.py）負責在跑
     報告前就驗證問題清單裡的規則名稱合法，這裡直接假設合法、用
-    VETO_RULES[rule_name] 查詢，錯字會在更早的階段被擋下。"""
-    system_prompt = _build_veto_system_prompt(rule_name)
+    VETO_RULES[rule_name] 查詢，錯字會在更早的階段被擋下。rules 是模板
+    自帶的規則（見 _build_veto_system_prompt()）；None 時用五不合作。"""
+    system_prompt = _build_veto_system_prompt(rule_name, rules)
     payload = {
         "model": chat_model,
         "messages": [
@@ -232,7 +278,7 @@ def detect_veto(rule_name, question, answer, context, chat_url, chat_model, time
     return result
 
 
-def summarize_veto_results(veto_entries):
+def summarize_veto_results(veto_entries, rules=None):
     """veto_entries: [{"question": str, "rule": str, "detection": dict,
     "heading": str|None}, ...]，detection 是 detect_veto() 的回傳值。
 
@@ -242,14 +288,15 @@ def summarize_veto_results(veto_entries):
     is_veto_triggered 為真的 OR 結果，"entries" 只放觸發的那些次呼叫
     （附上對應的 question/heading，方便報告追溯）。純邏輯，不牽涉 LLM，
     回傳值用 dict 保留固定的五條規則順序，跟 dimension_results 用維度
-    名稱當 key 的模式一致。
+    名稱當 key 的模式一致。rules 是模板自帶的規則時，改依模板規則的
+    順序；None 時用五不合作的固定順序。
     """
     by_rule = {}
     for entry in veto_entries:
         by_rule.setdefault(entry["rule"], []).append(entry)
 
     results = {}
-    for rule_name in VETO_RULES:
+    for rule_name in (VETO_RULES if rules is None else rules):
         if rule_name not in by_rule:
             continue
         entries = by_rule[rule_name]

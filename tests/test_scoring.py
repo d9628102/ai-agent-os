@@ -338,3 +338,26 @@ def test_build_dimension_bundle_no_group_id_ignores_conflicts():
     entries = [{"question": "Q1", "answer": "A1"}]
     results = [_consistency_result("營收", [("Q1", "100", True), ("Q2", "200", True)])]
     assert build_dimension_bundle(entries, results) == "問題：Q1\n回答：A1"
+
+
+# parse_scoring_response()：改用共用的 load_first_json_object() 之後，完整物件後面多一個
+# 結尾括號（深科技模板驗證時的真實輸出形狀 `{...}}`）不再讓整份評分失敗；九格也適用
+@pytest.mark.parametrize("raw", [
+    '{"score": 2, "rationale": "r", "evidence": ["e"]}}',
+    '<think>推理</think>\n{"score": 2, "rationale": "r", "evidence": ["e"]}}',
+])
+def test_parse_scoring_response_tolerates_trailing_brace(raw):
+    result = parse_scoring_response(raw)
+    assert result["parse_error"] is None
+    assert result["score"] == 2
+
+
+# parse_scoring_response()：物件本身不完整仍然失敗；解析出來不是物件（陣列）時視為解析失敗，不讓程式崩潰
+@pytest.mark.parametrize("raw", [
+    '{"score": 2, "rationale": "r", "evidence": ["e"]',
+    '[2]',
+])
+def test_parse_scoring_response_incomplete_or_non_object_fails(raw):
+    result = parse_scoring_response(raw)
+    assert result["score"] is None
+    assert result["parse_error"] is not None

@@ -56,6 +56,10 @@ declare -A TEST_TO_LOGIC=(
   ["tests/test_marketing_faithfulness.py"]="scripts/marketing_faithfulness.py"
   ["tests/test_marketing_tone_score.py"]="scripts/marketing_tone_score.py"
   ["tests/test_generate_marketing_copy.py"]="scripts/generate_marketing_copy.py"
+  ["tests/test_scoring_letter.py"]="scripts/scoring.py"
+  ["tests/test_gate_check.py"]="scripts/gate_check.py"
+  ["tests/test_veto_template_rules.py"]="scripts/veto_check.py"
+  ["tests/test_letter_report_helpers.py"]="scripts/generate_report.py"
 )
 
 run_pytest() {

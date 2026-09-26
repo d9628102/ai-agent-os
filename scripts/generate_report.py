@@ -59,13 +59,20 @@ from red_flag_detection import (  # noqa: E402
 )
 from scoring import (  # noqa: E402
     compute_weighted_total,
+    is_letter_template,
     lookup_grade,
     score_dimension,
+    validate_scoring_template,
 )
 from veto_check import (  # noqa: E402
     VETO_RULES,
     detect_veto,
     summarize_veto_results,
+)
+from gate_check import (  # noqa: E402
+    detect_gate,
+    render_gate_line,
+    summarize_gate_results,
 )
 
 # 跟 n8n「QA Deterministic Checks」/「QA LLM Judge」節點目前(修過 bug 後)
@@ -334,14 +341,23 @@ def render_consistency_section(consistency_results) -> str:
 def load_scoring_template(path: str, template_name: str) -> dict:
     """讀 scripts/data/scoring_templates.json，回傳指定模板名稱的設定。
     模板名稱打錯字時直接死掉列出可用的模板，不要跑到評分階段才發現——
-    跟 verify_sources_exist() 的 typo 前置檢查同一個原則。"""
+    跟 verify_sources_exist() 的 typo 前置檢查同一個原則。
+
+    讀到模板後接著跑 validate_scoring_template()：設定有誤（例如 letter
+    模板混進了權重或分數區間、Gate 指向不存在的維度）一樣在這裡直接
+    死掉並列出每一條錯誤——任何讀模板的呼叫端拿到的都是已經檢查過的
+    模板，不會跑完一輪 LLM 才在評分或渲染階段炸掉。"""
     if not os.path.isfile(path):
         die(f"找不到評分模板設定檔：{path}")
     with open(path, "r", encoding="utf-8") as f:
         templates = json.load(f)
     if template_name not in templates:
         die(f"評分模板 '{template_name}' 不存在。可用模板：{sorted(templates)}")
-    return templates[template_name]
+    template = templates[template_name]
+    errors = validate_scoring_template(template)
+    if errors:
+        die(f"評分模板 '{template_name}' 設定有誤：\n- " + "\n- ".join(errors))
+    return template
 
 
 def compute_scoring_summary(dimension_results, template):
@@ -451,22 +467,164 @@ def render_scoring_section(dimension_results, template) -> str:
     return "\n".join(lines)
 
 
-def render_veto_section(veto_results) -> str:
+def _table_cell(text) -> str:
+    """Markdown 表格儲存格：換行壓成空白、直線換成全形，避免把表格切壞。"""
+    return str(text).replace("\n", " ").replace("|", "｜")
+
+
+LETTER_OVERALL_TEXT = "由人工判斷"
+
+
+def build_letter_scoring_banner_line(dimension_results, template) -> str:
+    """letter 模板（深科技）的報頭評分標示：不訂權重、不算綜合等級，所以
+    不顯示任何總分，只明講綜合等級由人工判斷。沒有任何維度評分結果時回傳
+    None，跟 numeric 版「沒用到就不出現」同一個慣例。"""
+    if not dimension_results or not template:
+        return None
+    return f"**綜合評等**：{LETTER_OVERALL_TEXT}（{template_display_name(template)}不訂權重、不計算綜合等級）"
+
+
+def template_display_name(template) -> str:
+    """letter 模板必填 display_name（validate_scoring_template() 會擋），
+    這裡直接讀，不給預設值——預設值會讓其他字母模板默默顯示成深科技。"""
+    return template["display_name"]
+
+
+def render_letter_scoring_section(dimension_results, template, gate_results=None) -> str:
+    """letter 模板（深科技）的評分總表：每個維度一列字母等級＋依據摘要，
+    Gate 1/2 的查核結果接在對應維度那一列後面（只顯示、不自動改等級），
+    最後一列綜合固定寫「由人工判斷」。維度依模板順序列出，問題清單沒涵蓋
+    的維度也列出來標示未評分，不默默省略。不做任何字母轉分數、加總或
+    平均。gate_results 是 summarize_gate_results() 的回傳值。"""
+    if not dimension_results:
+        return ""
+    gate_results = gate_results or {}
+    gates_by_dim = {}
+    for gate in template.get("gates", []):
+        gates_by_dim.setdefault(gate["dimension"], []).append(gate)
+
+    lines = [
+        "## 評分總表",
+        "",
+        "> ⚠️ **驗證邊界**：此模板用字母等級，維度與 Gate 判準取自唯一一份深科技"
+        "範例（Branes.AI DD 報告）；評分只給模型每個維度的中性定義，不給範例案子"
+        "的結論或等級。只有一份範例，所以不訂權重、不計算綜合等級；Gate 查核"
+        "結果只顯示原文對應的調升或維持，不自動改動等級。**等級會浮動**：同一份"
+        "輸入重跑，同一個維度可能相差一級以上。字母等級僅供參考，最終由人工判斷，"
+        "判斷時請核對下方每個維度的引用原文。",
+        "",
+        "| 維度 | 等級 | 依據摘要 |", "|---|---|---|",
+    ]
+    for dim in template["dimensions"]:
+        result = dimension_results.get(dim)
+        if result is None:
+            lines.append(f"| {dim} | ⚠️ 未評分 | 問題清單未涵蓋此維度 |")
+            current = None
+        elif result["grade"] is None:
+            lines.append(f"| {dim} | ⚠️ 評分失敗，需人工判斷 | {_table_cell(result['parse_error'])} |")
+            current = None
+        else:
+            lines.append(f"| {dim} | {result['grade']} | {_table_cell(result['rationale'])} |")
+            current = result["grade"]
+        for gate in gates_by_dim.get(dim, []):
+            gid = gate["id"]
+            if gid in gate_results:
+                text = render_gate_line(gate, gate_results[gid]["status"], current, template)
+            else:
+                text = f"問題清單未標記 {gid}，未檢查。"
+            lines.append(f"| ↳ {gid} | — | {_table_cell(text)} |")
+    lines.append(f"| 綜合 | {LETTER_OVERALL_TEXT} | {template_display_name(template)}不計算綜合等級 |")
+    lines.append("")
+
+    for dim in template["dimensions"]:
+        result = dimension_results.get(dim)
+        if result is None or result["grade"] is None:
+            continue
+        lines.append(f"### {dim}（{result['grade']}）")
+        lines.append("")
+        lines.append(f"**評分依據**：{result['rationale']}")
+        lines.append("**引用**：")
+        for item in result["evidence"]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    if gate_results:
+        lines.append("### Gate 查核明細")
+        lines.append("")
+        status_text = {"met": "成立", "not_met": "不成立", "undetermined": "無法判定"}
+        for gid, summary in gate_results.items():
+            for entry in summary["entries"]:
+                heading = entry["heading"] or "（無法定位到具體片段）"
+                lines.append(f"- **{gid}**／「{entry['question']}」→ {status_text[entry['status']]}"
+                             f"（相關片段：{heading}）")
+                if entry["basis"]:
+                    lines.append(f"  - 判斷：{entry['basis']}")
+                if entry["quote"]:
+                    lines.append(f"  - 引用：「{entry['quote']}」")
+                if entry["parse_error"]:
+                    lines.append(f"  - ⚠️ 判斷結果解析失敗，歸入無法判定：{entry['parse_error']}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
+
+
+_DEFAULT_VETO_SECTION_NOTE = (
+    "> ⚠️ **驗證邊界**：以下判斷依《PSF六壬合夥生態系統》「五不合作」"
+    "條款，由模型輔助判斷。矛盾型（資源不實）跟缺失型（人不明、"
+    "權責不清、利益不明、風險不揭露）用不同的判斷邏輯——矛盾型要找"
+    "『主張跟查核結果對不上』，缺失型要找『文件明確承認揭露不完整』，"
+    "單純沒提到不算缺失。通過驗證只代表檢索與格式化正確，不是對模型"
+    "語意理解能力的嚴格證明，實際判斷仍需人工核對原文。"
+)
+
+
+def resolve_veto_config(scoring_template):
+    """決定這份報告的 veto 規則從哪裡來。沒指定模板、或模板沒有
+    veto_rules 時用五不合作（VETO_RULES），報告文字跟加入模板規則之前
+    逐字相同；模板有 veto_rules（深科技的 Gate 3）時改用模板的規則、
+    章節標題與後果文字。回傳 {"rules", "label", "section_title",
+    "section_note", "consequences"}；rules 是 None 代表五不合作（直接傳
+    給 veto_check 的函式，走它們的預設路徑）。純邏輯。"""
+    template_rules = (scoring_template or {}).get("veto_rules")
+    if not template_rules:
+        return {
+            "rules": None,
+            "label": "不合作紅線",
+            "section_title": "不合作紅線檢查",
+            "section_note": _DEFAULT_VETO_SECTION_NOTE,
+            "consequences": {name: "建議不合作" for name in VETO_RULES},
+        }
+    label = scoring_template["veto_label"]
+    return {
+        "rules": template_rules,
+        "label": label,
+        "section_title": f"{label}檢查",
+        "section_note": (
+            "> ⚠️ **驗證邊界**：以下判斷依評分模板自帶的否決規則"
+            f"（{'、'.join(r['source_label'] for r in template_rules.values())}），"
+            "沿用五不合作的 veto 判斷機制（缺失型要找『文件明確承認揭露不完整』，"
+            "單純沒提到不算缺失），由模型輔助判斷。通過驗證只代表檢索與格式化"
+            "正確，不是對模型語意理解能力的嚴格證明，實際判斷仍需人工核對原文。"
+        ),
+        "consequences": {name: rule["consequence"] for name, rule in template_rules.items()},
+    }
+
+
+def render_veto_section(veto_results, veto_config=None) -> str:
     """不合作紅線檢查章節，放在評分總表之後——這是比評分更底線的判斷，
     不管九格總分多高，觸發任一條veto都建議不合作，理當放在報告最後面
     的判斷章節。veto_results: summarize_veto_results() 的回傳值，只有
-    問題清單裡有 `## veto:` 標記時才會有內容可放。"""
+    問題清單裡有 `## veto:` 標記時才會有內容可放。veto_config 是
+    resolve_veto_config() 的回傳值；None 時等同五不合作。"""
     if not veto_results:
         return ""
+    config = veto_config or resolve_veto_config(None)
     lines = [
-        "## 不合作紅線檢查",
+        f"## {config['section_title']}",
         "",
-        "> ⚠️ **驗證邊界**：以下判斷依《PSF六壬合夥生態系統》「五不合作」"
-        "條款，由模型輔助判斷。矛盾型（資源不實）跟缺失型（人不明、"
-        "權責不清、利益不明、風險不揭露）用不同的判斷邏輯——矛盾型要找"
-        "『主張跟查核結果對不上』，缺失型要找『文件明確承認揭露不完整』，"
-        "單純沒提到不算缺失。通過驗證只代表檢索與格式化正確，不是對模型"
-        "語意理解能力的嚴格證明，實際判斷仍需人工核對原文。",
+        config["section_note"],
         "",
     ]
     for rule_name, result in veto_results.items():
@@ -488,18 +646,28 @@ def render_veto_section(veto_results) -> str:
     return "\n".join(lines)
 
 
-def build_veto_banner_line(veto_results) -> str:
+def build_veto_banner_line(veto_results, veto_config=None) -> str:
     """報告最上層的veto否決標示，跟報告狀態行並列——即使九格總分是A級
     核心夥伴，觸發veto時這一行一樣顯示「建議不合作」，兩個結論並存，
     不互相掩蓋。沒有任何veto被標記測試過時回傳 None，這一行完全不顯示
     （跟章節「沒用到就不出現」同一個慣例，避免舊報告多一行視覺噪音）。
-    純邏輯，抽成獨立函式方便測試這段組字邏輯。"""
+    純邏輯，抽成獨立函式方便測試這段組字邏輯。veto_config 是
+    resolve_veto_config() 的回傳值；None 時等同五不合作，輸出跟加入模板
+    規則之前逐字相同。模板規則觸發時顯示規則自己的後果（深科技 Gate 3：
+    「完成智財歸屬確認前不可投資」），不套用「建議不合作」。"""
     if not veto_results:
         return None
+    config = veto_config or resolve_veto_config(None)
     triggered_rules = [rule for rule, result in veto_results.items() if result["triggered"]]
     if triggered_rules:
-        return f"**不合作紅線**：🚫 觸發「{'、'.join(triggered_rules)}」——建議不合作"
-    return "**不合作紅線**：✅ 未觸發"
+        consequences = []
+        for rule in triggered_rules:
+            text = config["consequences"][rule]
+            if text not in consequences:
+                consequences.append(text)
+        return (f"**{config['label']}**：🚫 觸發「{'、'.join(triggered_rules)}」——"
+                f"{'；'.join(consequences)}")
+    return f"**{config['label']}**：✅ 未觸發"
 
 
 def generate_report(questions, collection, top_k, max_tokens, temperature,
@@ -515,11 +683,22 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         if unknown_dims:
             die(f"問題清單裡的維度名稱跟模板對不上：{unknown_dims}。"
                 f"模板裡的維度：{sorted(scoring_template['dimensions'])}")
+    veto_config = resolve_veto_config(scoring_template)
+    legal_vetoes = VETO_RULES if veto_config["rules"] is None else veto_config["rules"]
     referenced_vetoes = {item.get("veto") for item in questions if item.get("veto")}
-    unknown_vetoes = sorted(referenced_vetoes - set(VETO_RULES))
+    unknown_vetoes = sorted(referenced_vetoes - set(legal_vetoes))
     if unknown_vetoes:
-        die(f"問題清單裡的veto規則名稱跟文件定義的五條對不上：{unknown_vetoes}。"
-            f"合法規則：{sorted(VETO_RULES)}")
+        if veto_config["rules"] is None:
+            die(f"問題清單裡的veto規則名稱跟文件定義的五條對不上：{unknown_vetoes}。"
+                f"合法規則：{sorted(VETO_RULES)}")
+        die(f"問題清單裡的veto規則名稱跟評分模板的否決規則對不上：{unknown_vetoes}。"
+            f"合法規則：{sorted(legal_vetoes)}")
+    template_gates = {g["id"]: g for g in (scoring_template or {}).get("gates", [])}
+    referenced_gates = {item.get("gate") for item in questions if item.get("gate")}
+    unknown_gates = sorted(referenced_gates - set(template_gates))
+    if unknown_gates:
+        die(f"問題清單裡的 Gate 名稱跟評分模板對不上：{unknown_gates}。"
+            f"模板裡的 Gate：{sorted(template_gates) or '（這個模板沒有 Gate，或沒有指定 --scoring-template）'}")
     # 為什麼跨文件比對需要真正的 source 篩選、不能只靠語意相似度自然分開：
     # 實測過同一句問題不加篩選檢索兩份不同文件時，最高分是文件A的片段
     # （0.7247），但第二名是文件B的片段（0.6504）——分數差距不大，代表
@@ -534,6 +713,7 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
     red_flag_entries = []  # [{"question":..., "detection":..., "heading":...}, ...]
     dimension_entries = {}  # 維度名稱 -> [{"question","answer","detection","group_id"}, ...]
     veto_entries = []  # [{"question":..., "rule":..., "detection":..., "heading":...}, ...]
+    gate_entries = []  # [{"question":..., "gate":..., "detection":..., "heading":...}, ...]
 
     for i, item in enumerate(questions, start=1):
         question = item["question"]
@@ -609,6 +789,7 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
                 top_heading = result["hits"][0].get("payload", {}).get("heading_path")
             veto_detection = detect_veto(
                 veto_rule, question, result["visible"], result["context"], chat_url, chat_model,
+                rules=veto_config["rules"],
             )
             veto_entries.append({
                 "question": question, "rule": veto_rule,
@@ -616,7 +797,23 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
             })
             if veto_detection["is_veto_triggered"]:
                 veto_title = veto_rule
-                log(f"({i}/{len(questions)}) 🚫 觸發不合作紅線：{veto_rule}")
+                log(f"({i}/{len(questions)}) 🚫 觸發{veto_config['label']}：{veto_rule}")
+
+        gate_id = item.get("gate")
+        if gate_id:
+            log(f"({i}/{len(questions)}) 查核 {gate_id} 條件是否成立...")
+            top_heading = None
+            if result["hits"]:
+                top_heading = result["hits"][0].get("payload", {}).get("heading_path")
+            gate_detection = detect_gate(
+                template_gates[gate_id], question, result["visible"], result["context"],
+                chat_url, chat_model,
+            )
+            gate_entries.append({
+                "question": question, "gate": gate_id,
+                "detection": gate_detection, "heading": top_heading,
+            })
+            log(f"({i}/{len(questions)}) {gate_id}：{gate_detection['status']}")
 
         anchor = slugify_heading(heading_text(i, question))
         toc.append(f"{i}. [{question}](#{anchor})")
@@ -635,9 +832,14 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
             log(f"評分維度「{dimension}」...")
             dimension_results[dimension] = score_dimension(
                 dimension, entries, consistency_results, chat_url, chat_model,
+                template=scoring_template,
             )
 
-    veto_results = summarize_veto_results(veto_entries) if veto_entries else {}
+    veto_results = (summarize_veto_results(veto_entries, rules=veto_config["rules"])
+                    if veto_entries else {})
+    gate_results = (summarize_gate_results(gate_entries, scoring_template.get("gates", []))
+                    if gate_entries else {})
+    letter = scoring_template is not None and is_letter_template(scoring_template)
 
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     status_line = (
@@ -651,12 +853,15 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         f"**產生時間**：{now}",
         f"**報告狀態**：{status_line}",
     ]
-    scoring_banner = (
-        build_scoring_banner_line(dimension_results, scoring_template) if scoring_template else None
-    )
+    if letter:
+        scoring_banner = build_letter_scoring_banner_line(dimension_results, scoring_template)
+    else:
+        scoring_banner = (
+            build_scoring_banner_line(dimension_results, scoring_template) if scoring_template else None
+        )
     if scoring_banner:
         header.append(scoring_banner)
-    veto_banner = build_veto_banner_line(veto_results)
+    veto_banner = build_veto_banner_line(veto_results, veto_config)
     if veto_banner:
         header.append(veto_banner)
     header += [
@@ -667,13 +872,16 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
         "---",
         "",
     ]
-    scoring_section = (
-        render_scoring_section(dimension_results, scoring_template) if scoring_template else ""
-    )
+    if letter:
+        scoring_section = render_letter_scoring_section(dimension_results, scoring_template, gate_results)
+    else:
+        scoring_section = (
+            render_scoring_section(dimension_results, scoring_template) if scoring_template else ""
+        )
     return ("\n".join(header) + "\n" + render_red_flags_section(red_flags)
             + render_consistency_section(consistency_results)
             + scoring_section
-            + render_veto_section(veto_results)
+            + render_veto_section(veto_results, veto_config)
             + "\n".join(sections))
 
 
@@ -706,6 +914,14 @@ VETO_HEADER_RE = re.compile(
     r"^##\s*veto:\s*(?P<rule>.+?)\s*$", re.IGNORECASE,
 )
 
+# `## gate: <Gate id>`（例如 `## gate: Gate 1`）：深科技模板的 Gate 1/2
+# 條件查核標記，語法跟 `## veto:` 相同、互相獨立。合法的 Gate id 來自評分
+# 模板的 "gates"，檢查在 generate_report() 裡跑報告前就做。Gate 3 不走這
+# 個標記，走 `## veto:`（沿用 veto 機制）。`## gate: none` 清除。
+GATE_HEADER_RE = re.compile(
+    r"^##\s*gate:\s*(?P<gate>.+?)\s*$", re.IGNORECASE,
+)
+
 # dimension/veto 的清除不需要獨立的正規表達式——`## dimension: none`／
 # `## veto: none` 本身就會被上面兩個 HEADER_RE 正常捕捉成 dim="none"／
 # rule="none"，load_questions() 只要在賦值前檢查捕捉到的文字是不是（不分
@@ -733,7 +949,11 @@ def parse_source_tag(line: str):
 
 def load_questions(path):
     """回傳 [{"question": str, "group": str|None, "metric": str|None,
-    "source": str|None, "dimension": str|None, "veto": str|None}, ...]。
+    "source": str|None, "dimension": str|None, "veto": str|None,
+    "gate": str|None}, ...]。
+
+    `## gate: <Gate id>` 是第四個獨立、可選的標記（深科技模板的 Gate 1/2
+    條件查核），規則跟 `## veto:` 相同，`## gate: none` 清除。
 
     `## group: <id> | metric: <名稱>` 是可選的分組標記，標記之後的問題都
     屬於該組，直到下一個標記或檔案結束；標記之前（或整份檔案都沒有標記）
@@ -804,6 +1024,7 @@ def load_questions(path):
     current_group, current_metric = None, None
     current_dimension = None
     current_veto = None
+    current_gate = None
     with open(path, "r", encoding="utf-8") as f:
         for raw_line in f:
             line = raw_line.strip()
@@ -827,12 +1048,18 @@ def load_questions(path):
                 veto_value = vm.group("rule").strip()
                 current_veto = None if veto_value.lower() == _CLEAR_VALUE else veto_value
                 continue
+            gm = GATE_HEADER_RE.match(line)
+            if gm:
+                gate_value = gm.group("gate").strip()
+                current_gate = None if gate_value.lower() == _CLEAR_VALUE else gate_value
+                continue
             if line.startswith("#"):
                 continue
             source, line = parse_source_tag(line)
             questions.append({
                 "question": line, "group": current_group, "metric": current_metric,
                 "source": source, "dimension": current_dimension, "veto": current_veto,
+                "gate": current_gate,
             })
     return questions
 
@@ -846,14 +1073,15 @@ def render_tag_table(questions) -> str:
     上，那次錯誤花了完整跑一次報告、包括全部 LLM 呼叫才發現）。純邏輯，
     不牽涉 LLM，不觸發任何檢索或生成。"""
     lines = [
-        f"{'#':<4}{'source':<28}{'group':<10}{'metric':<18}{'dimension':<16}{'veto':<12}問題",
+        f"{'#':<4}{'source':<28}{'group':<10}{'metric':<18}{'dimension':<16}{'veto':<12}"
+        f"{'gate':<10}問題",
         "-" * 110,
     ]
     for i, item in enumerate(questions, start=1):
         lines.append(
             f"{i:<4}{item['source'] or '-':<28}{item['group'] or '-':<10}"
             f"{item['metric'] or '-':<18}{item['dimension'] or '-':<16}"
-            f"{item['veto'] or '-':<12}{item['question']}"
+            f"{item['veto'] or '-':<12}{item.get('gate') or '-':<10}{item['question']}"
         )
     return "\n".join(lines)
 
