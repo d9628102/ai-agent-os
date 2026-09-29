@@ -30,7 +30,8 @@ Usage:
 
   # Human override for a blocked --range: re-runs the same review, and if
   # there are still blocking findings, records who/when/why/which findings
-  # were overridden (locally + in Langfuse), good for OVERRIDE_TTL_MINUTES:
+  # were overridden (fully local; Langfuse only gets the decision, the approver
+  # and the time), good for OVERRIDE_TTL_MINUTES:
   python3 scripts/code_review_agent.py --override --range <old_sha>..<new_sha> \\
       --approver "your name" --reason "why this should go through anyway"
 """
@@ -561,6 +562,8 @@ def blocking_findings_of(all_findings_by_file):
 # delivery-center approval flow's "tamper-evident external record"
 # principle) under their own trace name/tag/score name so they never mix
 # with the delivery-center's pending-review/human_decision records.
+# Langfuse only gets the decision, the approver and the time -- never the
+# free-text reason or anything else from the local record (see below).
 # ---------------------------------------------------------------------------
 
 def compute_blocking_signature(range_str, blocking_findings):
@@ -619,21 +622,16 @@ def _post_json(url, payload, headers=None, timeout=20):
         return None, str(e.reason).encode("utf-8")
 
 
-def send_override_to_langfuse(range_str, approver, reason, blocking_findings, token, expires_at_iso):
-    if not (LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY):
-        log("沒有設定 LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY，略過寫入 Langfuse（本機紀錄仍會寫入）。")
-        return False
+# Langfuse 只收「決定、核准人、時間」（2026-09 決議：試運行期間 Langfuse 只記錄
+# 執行資料與治理紀錄的最小欄位）。reason、git range、finding 訊息、blocking 數量、
+# override token、到期時間都是本機才有的資訊，一律不送——它們仍完整寫在本機的
+# .code_review_overrides.jsonl。組出送出內容的函式刻意不接受這些參數，之後有人想
+# 多送欄位就得改函式簽名，測試（tests/test_langfuse_payloads.py）會擋下。
 
-    auth = "Basic " + base64.b64encode(
-        f"{LANGFUSE_PUBLIC_KEY}:{LANGFUSE_SECRET_KEY}".encode("utf-8")
-    ).decode("ascii")
-    headers = {"Authorization": auth, "x-langfuse-ingestion-version": "4"}
-
-    trace_id = uuid.uuid4().hex
-    span_id = uuid.uuid4().hex[:16]
-    now_ns = f"{int(time.time() * 1000)}000000"
-
-    trace_body = {
+def build_override_trace_body(approver, trace_id, span_id, now):
+    """override 的 Langfuse trace 內容。now 是 timezone-aware datetime。純邏輯。"""
+    now_ns = f"{int(now.timestamp() * 1000)}000000"
+    return {
         "resourceSpans": [{
             "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "code-review-agent"}}]},
             "scopeSpans": [{
@@ -650,40 +648,55 @@ def send_override_to_langfuse(range_str, approver, reason, blocking_findings, to
                         {"key": "langfuse.trace.tags",
                          "value": {"arrayValue": {"values": [{"stringValue": "code-review-override"}]}}},
                         {"key": "langfuse.observation.metadata.approver", "value": {"stringValue": approver}},
-                        {"key": "langfuse.observation.metadata.reason", "value": {"stringValue": reason}},
-                        {"key": "langfuse.observation.metadata.range", "value": {"stringValue": range_str}},
-                        {"key": "langfuse.observation.metadata.blocking_count",
-                         "value": {"intValue": len(blocking_findings)}},
-                        {"key": "langfuse.observation.metadata.token", "value": {"stringValue": token}},
-                        {"key": "langfuse.observation.metadata.expires_at", "value": {"stringValue": expires_at_iso}},
+                        {"key": "langfuse.observation.metadata.decided_at", "value": {"stringValue": now.isoformat()}},
                     ],
                     "status": {"code": 0},
                 }],
             }],
         }],
     }
+
+
+def build_override_score_body(approver, trace_id, event_id, score_id, now):
+    """override 的 Langfuse 決定紀錄（score-create）：決定（放行＝1）、核准人、時間。
+    沒有 comment。純邏輯。"""
+    return {
+        "batch": [{
+            "id": event_id,
+            "timestamp": now.isoformat(),
+            "type": "score-create",
+            "body": {
+                "id": score_id,
+                "traceId": trace_id,
+                "name": "code_review_override",
+                "value": 1,
+                "dataType": "BOOLEAN",
+                "comment": None,
+                "metadata": {"approver": approver, "decided_at": now.isoformat()},
+            },
+        }],
+    }
+
+
+def send_override_to_langfuse(approver):
+    if not (LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY):
+        log("沒有設定 LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY，略過寫入 Langfuse（本機紀錄仍會寫入）。")
+        return False
+
+    auth = "Basic " + base64.b64encode(
+        f"{LANGFUSE_PUBLIC_KEY}:{LANGFUSE_SECRET_KEY}".encode("utf-8")
+    ).decode("ascii")
+    headers = {"Authorization": auth, "x-langfuse-ingestion-version": "4"}
+
+    trace_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    trace_body = build_override_trace_body(approver, trace_id, uuid.uuid4().hex[:16], now)
     status, _ = _post_json(f"{LANGFUSE_BASE_URL}/api/public/otel/v1/traces", trace_body, headers=headers)
     if status != 200:
         log(f"寫入 Langfuse trace 失敗 (status={status})，本機紀錄仍然有效。")
         return False
 
-    score_body = {
-        "batch": [{
-            "id": str(uuid.uuid4()),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "type": "score-create",
-            "body": {
-                "id": str(uuid.uuid4()),
-                "traceId": trace_id,
-                "name": "code_review_override",
-                "value": 1,
-                "dataType": "BOOLEAN",
-                "comment": reason,
-                "metadata": {"approver": approver, "range": range_str,
-                             "blocking_count": len(blocking_findings)},
-            },
-        }],
-    }
+    score_body = build_override_score_body(approver, trace_id, str(uuid.uuid4()), str(uuid.uuid4()), now)
     _post_json(f"{LANGFUSE_BASE_URL}/api/public/ingestion", score_body, headers=headers)
     return True
 
@@ -754,9 +767,7 @@ def handle_override(args, repo_root, baseline_sources, spec_text):
         ],
     }
     append_override_record(repo_root, record)
-    sent = send_override_to_langfuse(
-        args.range, args.approver, args.reason, blocking, token, expires_at.isoformat()
-    )
+    sent = send_override_to_langfuse(args.approver)
 
     print(f"已記錄 override：{len(blocking)} 項阻斷級問題，審核人 {args.approver}")
     print(f"理由：{args.reason}")

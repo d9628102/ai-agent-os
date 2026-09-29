@@ -1,0 +1,208 @@
+{
+  "id": "4pYorQT9wbQIk41n",
+  "name": "PSF EIM QA Approval",
+  "active": true,
+  "nodes": [
+    {
+      "id": "e1f2a3b4-4444-4d4e-af5f-6b7c8d9e0f1a",
+      "name": "Webhook",
+      "webhookId": "5f8a2c1d-9e3b-4a7c-b1d5-2e6f9a4c8b0d",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        192,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "qa-approve",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "d6e7f8a9-9999-4c9d-8fae-1a2b3c4d5e6f",
+      "name": "IF valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        640,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "ok-cond",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "f2a3b4c5-5555-4e5f-bf6a-7c8d9e0f1a2b",
+      "name": "Build Decision Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        416,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const q = $input.item.json.query || {};\nconst traceId = (q.traceId || '').trim();\nconst rawDecision = (q.decision || '').trim().toLowerCase();\nconst approver = (q.approver || 'psf01').trim();\nconst note = (q.note || '').trim();\n\nconst VALID = { approve: 'approved', reject: 'rejected' };\nconst decision = VALID[rawDecision];\n\nif (!traceId || !decision) {\n  return {\n    ok: false,\n    message: '參數錯誤：需要 traceId 跟 decision(approve 或 reject)，' +\n      `目前收到 traceId=\"${traceId}\" decision=\"${rawDecision}\"`,\n  };\n}\n\nconst decided_at = new Date().toISOString();\n\nconst hex = (len) => Array.from({ length: len }, () => Math.floor(Math.random() * 16).toString(16)).join('');\nconst uuid4 = () => `${hex(8)}-${hex(4)}-4${hex(3)}-a${hex(3)}-${hex(12)}`;\n\n// score-create 是 Langfuse 舊版 ingestion API 裡唯一保證長期支援的事件類型\n// (2026-11-16 後其餘事件類型會被拒絕，score-create 不受影響)，用它來留下\n// 一筆不可否認的核准/駁回紀錄：誰、什麼時候、決定是什麼。\nconst decision_body = {\n  batch: [\n    {\n      id: uuid4(),\n      timestamp: decided_at,\n      type: 'score-create',\n      body: {\n        id: uuid4(),\n        traceId,\n        name: 'human_decision',\n        value: decision,\n        dataType: 'CATEGORICAL',\n        // note 是自由文字，不送 Langfuse，只留在本機執行紀錄；Langfuse 只收決定、approver、時間。\n        comment: null,\n        metadata: { approver, decided_at, source: 'qa-approve-webhook' },\n      },\n    },\n  ],\n};\n\nreturn { ok: true, traceId, decision, approver, note, decided_at, decision_body };\n"
+      }
+    },
+    {
+      "id": "a3b4c5d6-6666-4f6a-8f7b-8d9e0f1a2b3c",
+      "name": "Send Decision to Langfuse",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueRegularOutput",
+      "position": [
+        864,
+        -80
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://cloud.langfuse.com/api/public/ingestion",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-langfuse-ingestion-version",
+              "value": "4"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.decision_body }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "GHsZmLPXPJ0um4Jj",
+          "name": "Langfuse Basic Auth"
+        }
+      }
+    },
+    {
+      "id": "b4c5d6e7-7777-4a7b-9f8c-9e0f1a2b3c4d",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1088,
+        -80
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ '已記錄：trace ' + $('Build Decision Score').item.json.traceId + ' → ' + $('Build Decision Score').item.json.decision + '（審核人：' + $('Build Decision Score').item.json.approver + '，時間：' + $('Build Decision Score').item.json.decided_at + '）' }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "c5d6e7f8-8888-4b8c-af9d-0f1a2b3c4d5e",
+      "name": "Respond Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        864,
+        80
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.message }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Build Decision Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Decision Score": {
+      "main": [
+        [
+          {
+            "node": "IF valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF valid": {
+      "main": [
+        [
+          {
+            "node": "Send Decision to Langfuse",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Decision to Langfuse": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": null,
+  "pinData": null,
+  "tags": []
+}

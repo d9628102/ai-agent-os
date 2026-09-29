@@ -1,0 +1,454 @@
+{
+  "id": "XctHEK3cQdOp6WBd",
+  "name": "My workflow",
+  "active": true,
+  "nodes": [
+    {
+      "id": "7e55bed7-b0c5-4d91-aa86-17bfbf12559d",
+      "name": "On form submission",
+      "webhookId": "9fe3bbe9-faac-4162-a750-d7b6c0648cdb",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        192,
+        0
+      ],
+      "parameters": {
+        "formTitle": "PSF EIM 問答",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "你的問題"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b21d37e1-03da-4822-a301-d24b7200d302",
+      "name": "Execute a command",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        384,
+        0
+      ],
+      "parameters": {
+        "command": "=cd /home/psf01/Desktop/ai-agent-os && python3 scripts/rag_answer.py \"{{ $json['你的問題'] }}\" --show-context"
+      },
+      "credentials": {
+        "sshPassword": {
+          "id": "ANYvEOzdh8BBqskP",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "id": "4aa3c059-5335-41a5-b50c-951a1ae435b8",
+      "name": "Code in JavaScript",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const output = $input.item.json.stdout;\nconst match = output.match(/【回答】\\s*([\\s\\S]*?)\\n\\n【耗時】/);\nconst answer = match ? match[1].trim() : output;\n\n// 判斷這題實際上有沒有跑思考模式：可能是整批預設就開啟(DEFAULT_THINKING)，\n// 也可能是 detect_think_reason() 逐題規則覆寫開啟，兩種來源都要認。\nconst think_used = /思考模式\\s*開啟/.test(output) ||\n  /本題自動切換為 --think/.test(output);\n\nconst timeMatch = output.match(/端到端\\s*([\\d.]+)s/);\nconst total_time_s = timeMatch ? parseFloat(timeMatch[1]) : null;\n\nconst tokenMatch = output.match(/輸出\\s*(\\d+)\\s*tokens/);\nconst completion_tokens = tokenMatch ? parseInt(tokenMatch[1], 10) : null;\n\nconst question = $('On form submission').first().json['你的問題'];\n\nconst headingsMatch = output.match(/【檢索到的片段】\\s*([\\s\\S]*?)\\n\\n/);\nconst retrieved_headings = headingsMatch ? headingsMatch[1].trim() : '';\n\nconst contextMatch = output.match(/【送進模型的完整片段內容】\\s*([\\s\\S]*?)\\n\\n【回答】/);\nconst retrieved_context_full = contextMatch ? contextMatch[1].trim() : '';\n\nconst hex = (len) => Array.from({ length: len }, () => Math.floor(Math.random() * 16).toString(16)).join('');\nconst nowMs = Date.now();\nconst startMs = total_time_s ? nowMs - Math.round(total_time_s * 1000) : nowMs;\n\n// Langfuse 只收執行資料（耗時、token 數、成功、模型名稱、腳本名稱）：不送問題、回答、檢索片段。\n// 問題與回答只留在這個節點的輸出（n8n 本機執行紀錄），暫緩複核時從那裡看。\nconst langfuse_body = {\n  resourceSpans: [\n    {\n      resource: {\n        attributes: [\n          { key: \"service.name\", value: { stringValue: \"psf-eim-rag-n8n\" } }\n        ]\n      },\n      scopeSpans: [\n        {\n          scope: { name: \"n8n-psf-eim-rag\" },\n          spans: [\n            {\n              traceId: hex(32),\n              spanId: hex(16),\n              name: \"psf_eim_rag_answer\",\n              kind: 1,\n              startTimeUnixNano: `${startMs}000000`,\n              endTimeUnixNano: `${nowMs}000000`,\n              attributes: [\n                { key: \"langfuse.trace.name\", value: { stringValue: \"psf-eim-rag-qa\" } },\n                { key: \"langfuse.observation.type\", value: { stringValue: \"generation\" } },\n                { key: \"langfuse.observation.model.name\", value: { stringValue: \"Qwen/Qwen3-30B-A3B\" } },\n                { key: \"gen_ai.usage.output_tokens\", value: { intValue: completion_tokens || 0 } },\n                { key: \"langfuse.observation.metadata.think_used\", value: { boolValue: think_used } },\n                { key: \"langfuse.observation.metadata.total_time_s\", value: { doubleValue: total_time_s || 0 } },\n                { key: \"langfuse.observation.metadata.source\", value: { stringValue: \"n8n\" } },\n                { key: \"langfuse.observation.metadata.script\", value: { stringValue: \"rag_answer.py\" } }\n              ],\n              status: { code: 1 }\n            }\n          ]\n        }\n      ]\n    }\n  ]\n};\n\nconst traceId = langfuse_body.resourceSpans[0].scopeSpans[0].spans[0].traceId;\n\nreturn { answer, think_used, total_time_s, completion_tokens, question,\n         retrieved_headings, retrieved_context_full, traceId, langfuse_body };\n"
+      }
+    },
+    {
+      "id": "c3f1a2b4-6e8d-4a1c-9f2b-1d7e5a9c0b3f",
+      "name": "Log to Langfuse",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueRegularOutput",
+      "position": [
+        768,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://cloud.langfuse.com/api/public/otel/v1/traces",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-langfuse-ingestion-version",
+              "value": "4"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.langfuse_body }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "GHsZmLPXPJ0um4Jj",
+          "name": "Langfuse Basic Auth"
+        }
+      }
+    },
+    {
+      "id": "d4e2b8a1-3c5f-4a7b-8e9d-2f1a6c4b8e0d",
+      "name": "QA Deterministic Checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        944,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const src = $('Code in JavaScript').first().json;\nconst answer = src.answer || '';\n\n// 資訊性欄位：是否明確以「文件中未提及」誠實回應（不再拿來當 needs_review 的硬性\n// 判斷依據 —— 要求逐字出現「文件片段」字樣太嚴格，一般正常、有憑有據的直接回答\n// 本來就不會這樣寫，之前這樣設計反而對「答得好的完整回答」產生大量假陽性）\nconst explicitly_declined = /文件中(並)?未提及/.test(answer);\n\n// 截斷判斷改用真正可靠的訊號：生成是否真的撞到 max_tokens 上限（rag_answer.py\n// 預設 max_tokens=2048，SSH 呼叫沒有覆寫這個值）。撞上限才代表生成中途被切斷；\n// 純粹用「結尾標點」猜測太脆弱 —— 正常的條列式回答常以「）」「」」等收尾，\n// 之前的版本會把這種正常結尾誤判為截斷。\nconst MAX_TOKENS = 2048;\nconst hit_token_cap = typeof src.completion_tokens === 'number' &&\n  src.completion_tokens >= MAX_TOKENS - 8; // 留一點緩衝給極少數提前 stop 的邊界情況\nconst not_truncated = answer.trim().length > 0 && !hit_token_cap;\n\n// 亂碼/生成迴圈偵測：Unicode 替代字元,或同一字元連續出現 10 次以上\nconst has_garbled = /�/.test(answer) || /(.)\\1{9,}/.test(answer);\nconst no_garbled = !has_garbled;\n\n// deterministic_pass 現在只擋「明顯故障」的情況（截斷、亂碼、空白），不再要求\n// 特定措辭 —— 措辭層面的忠實度判斷交給看得到全文的 LLM judge 去做，比規則式\n// 關鍵字比對可靠得多。\nconst deterministic_pass = not_truncated && no_garbled;\n\nreturn {\n  ...src,\n  explicitly_declined,\n  not_truncated,\n  no_garbled,\n  deterministic_pass,\n};\n"
+      }
+    },
+    {
+      "id": "e5f3c9b2-4d6a-4b8c-9f0e-3a2b7d5c9f1e",
+      "name": "QA LLM Judge",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueRegularOutput",
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://192.168.1.128:8000/v1/chat/completions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  \"model\": \"Qwen/Qwen3-30B-A3B\",\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"你是嚴格的 RAG 問答品質評審員。你會看到：使用者問題、檢索到的文件片段全文、以及系統產生的回答。請針對兩個維度各給 1-10 的整數評分：\\n1. faithfulness(忠實度)：逐項核對回答裡的每個具體主張(名稱、數字、職責描述、專有名詞等)是否能在提供的文件片段全文裡找到依據。只要是片段全文裡明確寫到的內容，即使回答是逐字引用或改寫，都算忠實，不算捏造；只有片段全文找不到根據、且回答仍明確斷言的內容才算捏造，該大幅扣分。若片段全文不足以回答問題，回答有沒有誠實說「文件中未提及」而不是硬掰。\\n2. relevance(相關性)：回答是否切題回應了使用者的問題，而不是答非所問或離題。\\n請只輸出一個 JSON 物件，格式為 {\\\"faithfulness\\\": <整數>, \\\"relevance\\\": <整數>, \\\"reasoning\\\": \\\"<20字以內的簡短理由>\\\"}，不要有任何其他文字、不要用 markdown code fence。\" },\n    { \"role\": \"user\", \"content\": \"問題：\" + $json.question + \"\\n\\n檢索到的文件片段全文：\\n\" + ($json.retrieved_context_full || $json.retrieved_headings) + \"\\n\\n系統回答：\\n\" + $json.answer }\n  ],\n  \"temperature\": 0,\n  \"max_tokens\": 300,\n  \"chat_template_kwargs\": { \"enable_thinking\": false }\n} }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "f6a4d0c3-5e7b-4c9d-a01f-4b3c8e6d0a2f",
+      "name": "QA Parse & Threshold",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1296,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const src = $('QA Deterministic Checks').first().json;\n\nlet raw = '';\ntry {\n  raw = $input.item.json.choices[0].message.content || '';\n} catch (e) {\n  raw = '';\n}\nraw = raw.replace(/<think>[\\s\\S]*?<\\/think>/g, '').trim();\nraw = raw.replace(/^```(json)?/i, '').replace(/```$/, '').trim();\n\nlet faithfulness = null, relevance = null, reasoning = '';\nlet judge_parse_error = false;\ntry {\n  const parsed = JSON.parse(raw);\n  faithfulness = Number(parsed.faithfulness);\n  relevance = Number(parsed.relevance);\n  reasoning = String(parsed.reasoning || '').slice(0, 200);\n  if (!Number.isFinite(faithfulness) || !Number.isFinite(relevance)) {\n    judge_parse_error = true;\n  }\n} catch (e) {\n  judge_parse_error = true;\n}\n\n// Known Issue #7 對應的保守門檻：忠實度 < 7、格式/引用檢查沒過、或 judge 輸出解析失敗，\n// 一律標記為需人工審核（sunset warning：/api/public/ingestion 2026-11-16 後只接受\n// score-create，其餘事件類型會被拒絕；本節點只送 score-create，屬於長期支援路徑）。\nconst FAITHFULNESS_THRESHOLD = 7;\nconst needs_review = judge_parse_error || !src.deterministic_pass ||\n  faithfulness === null || faithfulness < FAITHFULNESS_THRESHOLD;\n\nconst hex = (len) => Array.from({ length: len }, () => Math.floor(Math.random() * 16).toString(16)).join('');\nconst uuid4 = () => `${hex(8)}-${hex(4)}-4${hex(3)}-a${hex(3)}-${hex(12)}`;\nconst nowIso = new Date().toISOString();\nconst traceId = src.traceId;\n\nfunction scoreEvent(name, value, dataType, comment) {\n  return {\n    id: uuid4(),\n    timestamp: nowIso,\n    type: 'score-create',\n    body: { id: uuid4(), traceId, name, value, dataType, comment: comment || null },\n  };\n}\n\n// 只送分數（數字/布林）。評審理由（reasoning）會帶到回答內容，不送 Langfuse，只留在本機執行紀錄。\nconst qa_batch_body = {\n  batch: [\n    scoreEvent('faithfulness', faithfulness ?? 0, 'NUMERIC',\n      judge_parse_error ? 'judge 輸出無法解析' : null),\n    scoreEvent('relevance', relevance ?? 0, 'NUMERIC', null),\n    scoreEvent('needs_review', needs_review ? 1 : 0, 'BOOLEAN',\n      judge_parse_error ? 'judge 輸出解析失敗，保守標記需人工審核' :\n      (!src.deterministic_pass ? '格式/引用檢查未通過' : null)),\n  ],\n};\n\nreturn {\n  ...src,\n  faithfulness,\n  relevance,\n  judge_reasoning: reasoning,\n  judge_parse_error,\n  needs_review,\n  qa_batch_body,\n};\n"
+      }
+    },
+    {
+      "id": "a7b5e1d4-6f8c-4a0b-b12e-5c4d9f7e1b3a",
+      "name": "Send QA Scores to Langfuse",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueRegularOutput",
+      "position": [
+        1472,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://cloud.langfuse.com/api/public/ingestion",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-langfuse-ingestion-version",
+              "value": "4"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.qa_batch_body }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "GHsZmLPXPJ0um4Jj",
+          "name": "Langfuse Basic Auth"
+        }
+      }
+    },
+    {
+      "id": "b1a2c3d4-1111-4a1b-9c2d-3e4f5a6b7c8d",
+      "name": "IF needs_review",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1648,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "needs-review-cond",
+              "leftValue": "={{ $('QA Parse & Threshold').item.json.needs_review }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "c2b3d4e5-2222-4b2c-8d3e-4f5a6b7c8d9e",
+      "name": "Build Pending-Review Tag",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1824,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "const src = $('Code in JavaScript').first().json;\nconst traceId = src.traceId;\n\nconst hex = (len) => Array.from({ length: len }, () => Math.floor(Math.random() * 16).toString(16)).join('');\nconst nowMs = Date.now();\n\nconst tag_body = {\n  resourceSpans: [\n    {\n      resource: { attributes: [{ key: \"service.name\", value: { stringValue: \"psf-eim-rag-n8n\" } }] },\n      scopeSpans: [\n        {\n          scope: { name: \"n8n-psf-eim-rag\" },\n          spans: [\n            {\n              traceId: traceId,\n              spanId: hex(16),\n              name: \"qa_flag_pending_review\",\n              kind: 1,\n              startTimeUnixNano: `${nowMs}000000`,\n              endTimeUnixNano: `${nowMs}000000`,\n              attributes: [\n                {\n                  key: \"langfuse.trace.tags\",\n                  value: { arrayValue: { values: [{ stringValue: \"pending-review\" }] } }\n                }\n              ],\n              status: { code: 0 }\n            }\n          ]\n        }\n      ]\n    }\n  ]\n};\n\nreturn { tag_body, traceId };\n"
+      }
+    },
+    {
+      "id": "d3c4e5f6-3333-4c3d-9e4f-5a6b7c8d9e0f",
+      "name": "Tag Pending Review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueRegularOutput",
+      "position": [
+        2000,
+        -80
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://cloud.langfuse.com/api/public/otel/v1/traces",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-langfuse-ingestion-version",
+              "value": "4"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.tag_body }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "GHsZmLPXPJ0um4Jj",
+          "name": "Langfuse Basic Auth"
+        }
+      }
+    },
+    {
+      "id": "bd8242d0-34a7-43ca-a60b-d53d867dc17b",
+      "name": "Form",
+      "webhookId": "f400a76e-4f89-4a06-9331-f6a0ec60ae55",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        2176,
+        0
+      ],
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $('QA Parse & Threshold').item.json.needs_review ? \"此回答已標記為需人工複核，暫緩發布。我們會盡快確認後更新，造成不便敬請見諒。\" : $('Code in JavaScript').item.json.answer }}"
+      }
+    }
+  ],
+  "connections": {
+    "On form submission": {
+      "main": [
+        [
+          {
+            "node": "Execute a command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Log to Langfuse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Langfuse": {
+      "main": [
+        [
+          {
+            "node": "QA Deterministic Checks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "QA Deterministic Checks": {
+      "main": [
+        [
+          {
+            "node": "QA LLM Judge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "QA LLM Judge": {
+      "main": [
+        [
+          {
+            "node": "QA Parse & Threshold",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "QA Parse & Threshold": {
+      "main": [
+        [
+          {
+            "node": "Send QA Scores to Langfuse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send QA Scores to Langfuse": {
+      "main": [
+        [
+          {
+            "node": "IF needs_review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF needs_review": {
+      "main": [
+        [
+          {
+            "node": "Build Pending-Review Tag",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Pending-Review Tag": {
+      "main": [
+        [
+          {
+            "node": "Tag Pending Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tag Pending Review": {
+      "main": [
+        [
+          {
+            "node": "Form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "tags": []
+}
