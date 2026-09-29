@@ -66,7 +66,10 @@ from scoring import (  # noqa: E402
 )
 from veto_check import (  # noqa: E402
     VETO_RULES,
+    STATUS_SILENT,
+    STATUS_UNDETERMINED,
     detect_veto,
+    detection_status,
     summarize_veto_results,
 )
 from gate_check import (  # noqa: E402
@@ -607,9 +610,22 @@ def resolve_veto_config(scoring_template):
             "沿用五不合作的 veto 判斷機制（缺失型要找『文件明確承認揭露不完整』，"
             "單純沒提到不算缺失），由模型輔助判斷。通過驗證只代表檢索與格式化"
             "正確，不是對模型語意理解能力的嚴格證明，實際判斷仍需人工核對原文。"
+            "觸發必須附上一句從文件片段逐字複製、程式已驗證的引文；文件沒有提到"
+            "該主題時不算觸發，會顯示「⏸ 檢索到的片段未提及此主題，需人工確認」"
+            "（不是「✅ 未觸發」）；模型輸出無法解析時顯示「⚠️ 無法判定，需人工確認」。"
         ),
         "consequences": {name: rule["consequence"] for name, rule in template_rules.items()},
     }
+
+
+def _render_unconfirmed_entries(entries) -> list:
+    """沉默／無法判定的規則底下，列出是哪幾題、以及降級或無法判定的原因，讓人
+    知道要去確認什麼。沒有 entries 時回傳空清單。純邏輯。"""
+    lines = []
+    for entry in entries or []:
+        reason = f"（{entry['reason']}）" if entry.get("reason") else ""
+        lines.append(f"  - 「{entry['question']}」{reason}")
+    return lines
 
 
 def render_veto_section(veto_results, veto_config=None) -> str:
@@ -629,7 +645,16 @@ def render_veto_section(veto_results, veto_config=None) -> str:
     ]
     for rule_name, result in veto_results.items():
         if not result["triggered"]:
-            lines.append(f"- ✅ **{rule_name}**：未觸發")
+            # 沒有 status 欄位的舊格式一律當成「未觸發」，輸出跟加入新狀態之前逐字相同
+            state = result.get("status", "clear")
+            if state == STATUS_UNDETERMINED:
+                lines.append(f"- ⚠️ **{rule_name}**：無法判定（模型輸出無法解析），需人工確認")
+                lines.extend(_render_unconfirmed_entries(result.get("undetermined_entries")))
+            elif state == STATUS_SILENT:
+                lines.append(f"- ⏸ **{rule_name}**：檢索到的片段未提及此主題，需人工確認")
+                lines.extend(_render_unconfirmed_entries(result.get("silent_entries")))
+            else:
+                lines.append(f"- ✅ **{rule_name}**：未觸發")
             continue
         lines.append(f"### 🚫 {rule_name}")
         lines.append("")
@@ -667,6 +692,13 @@ def build_veto_banner_line(veto_results, veto_config=None) -> str:
                 consequences.append(text)
         return (f"**{config['label']}**：🚫 觸發「{'、'.join(triggered_rules)}」——"
                 f"{'；'.join(consequences)}")
+    undetermined_rules = [rule for rule, result in veto_results.items()
+                          if result.get("status") == STATUS_UNDETERMINED]
+    if undetermined_rules:
+        return f"**{config['label']}**：⚠️ 無法判定「{'、'.join(undetermined_rules)}」——需人工確認"
+    silent_rules = [rule for rule, result in veto_results.items() if result.get("status") == STATUS_SILENT]
+    if silent_rules:
+        return f"**{config['label']}**：⏸ 檢索到的片段未提及「{'、'.join(silent_rules)}」——需人工確認"
     return f"**{config['label']}**：✅ 未觸發"
 
 
@@ -795,9 +827,14 @@ def generate_report(questions, collection, top_k, max_tokens, temperature,
                 "question": question, "rule": veto_rule,
                 "detection": veto_detection, "heading": top_heading,
             })
-            if veto_detection["is_veto_triggered"]:
+            veto_state = detection_status(veto_detection)
+            if veto_state == "triggered":
                 veto_title = veto_rule
                 log(f"({i}/{len(questions)}) 🚫 觸發{veto_config['label']}：{veto_rule}")
+            elif veto_state == STATUS_SILENT:
+                log(f"({i}/{len(questions)}) ⏸ 「{veto_rule}」：檢索到的片段未提及此主題，需人工確認")
+            elif veto_state == STATUS_UNDETERMINED:
+                log(f"({i}/{len(questions)}) ⚠️ 「{veto_rule}」：無法判定，需人工確認")
 
         gate_id = item.get("gate")
         if gate_id:

@@ -38,6 +38,7 @@ veto_check.py
 import json
 import re
 
+from marketing_faithfulness import _norm_for_quote, load_first_json_object, unbacked_quote_pieces
 from rag_common import JSON_OUTPUT_REMINDER, http_json
 
 VETO_RULES = {
@@ -183,6 +184,149 @@ def _build_veto_system_prompt(rule_name: str, rules: dict = None) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# 「有引文驗證的缺失型」判斷（規則設定 verify_quote=true 才走這條路，目前只有
+# 深科技模板的 Gate 3）。沒有這個旗標的規則（所有五不合作）完全走上面原本的
+# prompt、解析與顯示，一個字都不動。
+#
+# 為什麼需要：問答系統（rag_answer.py）被要求「文件沒寫就回答『文件中未提及』
+# 並說明相關內容為何不足以回答」，而原本的缺失型 prompt 把「回答或檢索片段裡出現
+# 『未揭露』『不明』…」都當證據，於是沉默被讀成「承認不完整」（2026-09-29 用
+# PSF EIM 公開文件實測：4 個沉默案例 2 個誤觸發）。做法是三態＋逐字引文＋程式
+# 驗證：
+#   admitted  文件片段裡有一句話表示資訊目前不完整，quote 是那句話（逐字）
+#   silent    文件片段沒談到這個主題（不觸發，但報告要標「需人工確認」）
+#   clear     文件談到了、而且資訊完整
+# 「admitted」必須附一句程式驗證過確實出現在檢索片段裡的引文，驗證不過就降級成
+# silent——所以最壞的漏判結果是「⏸ 需人工確認」，不是「✅ 未觸發」。
+# ---------------------------------------------------------------------------
+
+STATUS_ADMITTED = "admitted"
+STATUS_SILENT = "silent"
+STATUS_CLEAR = "clear"
+STATUS_UNDETERMINED = "undetermined"
+_MODEL_STATUSES = (STATUS_ADMITTED, STATUS_SILENT, STATUS_CLEAR)
+
+# 引文正規化（去空白、標點、Markdown *）之後至少要有這麼多字才算「可驗證」，
+# 避免「未揭露」這種兩三個字的片段輕易在文件任何地方湊巧比對成功。
+MIN_QUOTE_CHARS = 6
+
+REASON_NO_QUOTE = "模型判為承認不完整，但沒有給出足夠長的引文，無法驗證"
+REASON_QUOTE_NOT_IN_CONTEXT = "模型判為承認不完整，但引用的句子不在檢索到的文件片段裡（可能來自系統回答、改寫或摘要）"
+
+_VERIFIED_ABSENCE_PROMPT = (
+    "你是嚴謹的盡職調查分析師。你會看到一則問答的問題、系統回答，以及檢索到的『文件片段全文』。"
+    "你的任務是判斷『文件本身』有沒有表示下面這項資訊目前不完整。\n"
+    "規則名稱：{name}；定義：{desc}\n"
+    "重要：『系統回答』是另一個模型讀完文件片段後寫的。它寫「文件中未提及」「未說明」只代表『檢索到的片段沒有涵蓋這個主題』，"
+    "**不是文件承認資訊不完整**，絕對不能拿系統回答裡的話當證據。證據只能來自『文件片段全文』。\n"
+    "請三選一，輸出 status：\n"
+    "- \"admitted\"：文件片段裡有一句話，表示這項資訊『目前是不完整的』。下面三種都算：\n"
+    "  (a) 直接寫未揭露／不明／未具名／尚未取得／尚待確認／有待補充；\n"
+    "  (b) 文件把這項資訊列為『必須在投資前釐清的問題』，或列為『要求對方取得／補充／提供』的項目（要求取得，就表示現在還沒有）；\n"
+    "  (c) 只揭露一部分、其餘未知（例如「僅揭露 38.2%，其餘不明」）。\n"
+    "  此時 quote 必須是表達這一點的那一句話，從文件片段逐字複製，不能改寫、不能摘要、不能翻譯、不能把不同地方的字拼在一起。\n"
+    "- \"silent\"：文件片段根本沒有談到這個主題（沒寫，也沒說它不完整、待釐清或要求補充）。這不算觸發，quote 填 null。\n"
+    "- \"clear\"：文件片段談到了這個主題，而且資訊看起來完整，沒有說不完整。quote 填 null。\n"
+    "判斷時只看『文件片段全文』：文件有沒有一句話把這個主題說成『還沒有／還不清楚／要去取得』？沒有就是 silent 或 clear，不要自己推論。\n"
+    "status 是 admitted 時，另外輸出：phenomenon（一句話說明具體缺了什麼）、"
+    "suggested_action（以「{consequence}」為前提，具體寫出除非對方能補充／取得什麼，否則維持「{consequence}」的建議）；其他情況這兩個欄位填 null。\n"
+    "{json_reminder}\n"
+    "請只輸出一個 JSON 物件：{{\"status\": \"admitted\"|\"silent\"|\"clear\", \"quote\": \"<逐字引文或null>\", "
+    "\"phenomenon\": \"<一句話或null>\", \"suggested_action\": \"<字串或null>\"}}\n"
+    "不要有任何其他文字、不要用 markdown code fence。"
+)
+
+
+def _build_verified_absence_prompt(rule_name: str, rules: dict) -> str:
+    """有引文驗證的缺失型 system prompt。rules 是模板自帶的規則（含 description、
+    consequence）。純邏輯。"""
+    rule = rules[rule_name]
+    return _VERIFIED_ABSENCE_PROMPT.format(
+        name=rule_name, desc=rule["description"], consequence=rule["consequence"],
+        json_reminder=JSON_OUTPUT_REMINDER,
+    )
+
+
+def verify_quote_in_context(quote, context: str):
+    """檢查 quote 是不是（逐字）出現在檢索片段全文裡。回傳 (通過與否, 原因或None,
+    找不到的片段清單)。沿用行銷文案 Guard E 的比對：引文在標點處拆成片段逐段比對，
+    正規化時去掉空白、標點與 Markdown 的 `*`。純邏輯。"""
+    if not isinstance(quote, str) or len(_norm_for_quote(quote)) < MIN_QUOTE_CHARS:
+        return False, REASON_NO_QUOTE, []
+    missing = unbacked_quote_pieces(quote, _norm_for_quote(context))
+    if missing:
+        return False, REASON_QUOTE_NOT_IN_CONTEXT, missing
+    return True, None, []
+
+
+def _undetermined(parse_error, rule=None):
+    return {
+        "status": STATUS_UNDETERMINED, "is_veto_triggered": False, "phenomenon": None, "basis": None,
+        "suggested_action": None, "quote": None, "downgrade_reason": None, "missing_pieces": [],
+        "parse_error": parse_error,
+    }
+
+
+def parse_verified_absence_response(raw: str, context: str, consequence: str) -> dict:
+    """把三態判斷的模型輸出解析並驗證。永遠回傳結構一致的 dict：
+    - JSON 解析失敗、不是物件、status 不是三個合法值之一 → undetermined（帶 parse_error）
+    - admitted 但引文缺漏／太短／不在檢索片段裡 → 降級成 silent（downgrade_reason 記原因）
+    - admitted 且引文驗證通過 → 觸發（basis 是「引文」，phenomenon／suggested_action
+      缺漏時補上預設文字，不因為欄位沒填就丟掉一個驗證過的引文）
+    純邏輯，不牽涉 LLM。"""
+    try:
+        parsed = load_first_json_object(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return _undetermined(f"veto判斷結果無法解析成 JSON，原始輸出前 300 字：{raw[:300]}")
+    if not isinstance(parsed, dict):
+        return _undetermined(f"veto判斷結果不是 JSON 物件：{str(parsed)[:300]}")
+
+    status = parsed.get("status")
+    status = status.strip().lower() if isinstance(status, str) else status
+    if status not in _MODEL_STATUSES:
+        return _undetermined(f"veto判斷結果的 status 不是 admitted／silent／clear：{str(parsed)[:300]}")
+
+    result = {
+        "status": status, "is_veto_triggered": False, "phenomenon": None, "basis": None,
+        "suggested_action": None, "quote": None, "downgrade_reason": None, "missing_pieces": [],
+        "parse_error": None,
+    }
+    if status != STATUS_ADMITTED:
+        return result
+
+    quote = parsed.get("quote")
+    ok, reason, missing = verify_quote_in_context(quote, context)
+    if not ok:
+        result.update({"status": STATUS_SILENT, "downgrade_reason": reason, "missing_pieces": missing,
+                       "quote": quote if isinstance(quote, str) else None})
+        return result
+
+    result.update({
+        "is_veto_triggered": True,
+        "quote": quote.strip(),
+        "basis": f"「{quote.strip()}」",
+        "phenomenon": parsed.get("phenomenon") or "（模型未說明具體現象，請對照引文）",
+        "suggested_action": parsed.get("suggested_action") or f"在補齊資訊之前，維持「{consequence}」",
+    })
+    return result
+
+
+def detection_status(detection: dict) -> str:
+    """一次 veto 判斷結果的狀態：triggered／undetermined／silent／clear。
+    新格式（有 status）直接對應；舊格式（五不合作，沒有 status）：is_veto_triggered
+    為真＝觸發；沒觸發但有 parse_error＝無法判定（原本會被當成「未觸發」，報告顯示
+    ✅，是假放心）；其餘＝clear。純邏輯。"""
+    status = detection.get("status")
+    if status == STATUS_ADMITTED or (status is None and detection.get("is_veto_triggered")):
+        return "triggered"
+    if status == STATUS_UNDETERMINED or (status is None and detection.get("parse_error")):
+        return STATUS_UNDETERMINED
+    if status == STATUS_SILENT:
+        return STATUS_SILENT
+    return STATUS_CLEAR
+
+
 def _strip_think(text: str) -> str:
     return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
 
@@ -243,7 +387,15 @@ def detect_veto(rule_name, question, answer, context, chat_url, chat_model, time
     VETO_RULES 裡的合法規則名稱——呼叫端（generate_report.py）負責在跑
     報告前就驗證問題清單裡的規則名稱合法，這裡直接假設合法、用
     VETO_RULES[rule_name] 查詢，錯字會在更早的階段被擋下。rules 是模板
-    自帶的規則（見 _build_veto_system_prompt()）；None 時用五不合作。"""
+    自帶的規則（見 _build_veto_system_prompt()）；None 時用五不合作。
+
+    規則設定有 verify_quote=true 時（目前只有深科技的 Gate 3）改走三態＋引文驗證
+    （見 _detect_verified_absence()）；其餘規則走下面原本的路徑，回傳的 dict 跟
+    加入這個旗標之前完全相同。"""
+    active_rules = VETO_RULES if rules is None else rules
+    if active_rules[rule_name].get("verify_quote"):
+        return _detect_verified_absence(rule_name, question, answer, context, chat_url, chat_model,
+                                        timeout, active_rules)
     system_prompt = _build_veto_system_prompt(rule_name, rules)
     payload = {
         "model": chat_model,
@@ -278,6 +430,39 @@ def detect_veto(rule_name, question, answer, context, chat_url, chat_model, time
     return result
 
 
+def _detect_verified_absence(rule_name, question, answer, context, chat_url, chat_model, timeout, rules):
+    """三態＋引文驗證的單題判斷。輸入與呼叫參數（溫度 0、思考模式、2048 tokens）
+    跟原本的缺失型判斷相同，只有 prompt 與解析不同。永遠回傳 dict（含 "rule"），
+    不拋例外。"""
+    payload = {
+        "model": chat_model,
+        "messages": [
+            {"role": "system", "content": _build_verified_absence_prompt(rule_name, rules)},
+            {
+                "role": "user",
+                "content": (
+                    f"問題：{question}\n\n系統回答：\n{answer}\n\n"
+                    f"檢索到的文件片段全文：\n{context}"
+                ),
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 2048,
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
+    status, resp = http_json("POST", chat_url, payload, timeout=timeout)
+    if status != 200:
+        result = _undetermined(f"呼叫veto判斷模型失敗 (HTTP {status}): {resp}")
+    else:
+        try:
+            raw = resp["choices"][0]["message"].get("content") or ""
+            result = parse_verified_absence_response(raw, context, rules[rule_name]["consequence"])
+        except (KeyError, IndexError, TypeError):
+            result = _undetermined(f"veto判斷模型回應格式不如預期: {resp}")
+    result["rule"] = rule_name
+    return result
+
+
 def summarize_veto_results(veto_entries, rules=None):
     """veto_entries: [{"question": str, "rule": str, "detection": dict,
     "heading": str|None}, ...]，detection 是 detect_veto() 的回傳值。
@@ -290,6 +475,11 @@ def summarize_veto_results(veto_entries, rules=None):
     回傳值用 dict 保留固定的五條規則順序，跟 dimension_results 用維度
     名稱當 key 的模式一致。rules 是模板自帶的規則時，改依模板規則的
     順序；None 時用五不合作的固定順序。
+
+    每條規則的結果除了 "triggered"／"entries"，還有 "status"（triggered／
+    undetermined／silent／clear）與對應的 silent_entries／undetermined_entries。
+    判斷結果沒有 status 的舊格式（五不合作）：沒觸發但有 parse_error 的，現在
+    算「無法判定」，不再默默當成「未觸發」。
     """
     by_rule = {}
     for entry in veto_entries:
@@ -300,10 +490,11 @@ def summarize_veto_results(veto_entries, rules=None):
         if rule_name not in by_rule:
             continue
         entries = by_rule[rule_name]
-        triggered_entries = []
+        triggered_entries, silent_entries, undetermined_entries = [], [], []
         for entry in entries:
             det = entry["detection"]
-            if det["is_veto_triggered"]:
+            state = detection_status(det)
+            if state == "triggered":
                 triggered_entries.append({
                     "question": entry["question"],
                     "heading": entry["heading"],
@@ -311,8 +502,31 @@ def summarize_veto_results(veto_entries, rules=None):
                     "basis": det["basis"],
                     "suggested_action": det["suggested_action"],
                 })
+            elif state == STATUS_SILENT:
+                silent_entries.append({
+                    "question": entry["question"], "heading": entry.get("heading"),
+                    "reason": det.get("downgrade_reason"),
+                })
+            elif state == STATUS_UNDETERMINED:
+                undetermined_entries.append({
+                    "question": entry["question"], "heading": entry.get("heading"),
+                    "reason": (det.get("parse_error") or "")[:160],
+                })
+        # 規則的狀態：觸發 > 無法判定 > 文件未提及 > 未觸發。沉默與無法判定都不是
+        # 「未觸發」——報告要標「需人工確認」，不能顯示成 ✅。
+        if triggered_entries:
+            rule_state = "triggered"
+        elif undetermined_entries:
+            rule_state = STATUS_UNDETERMINED
+        elif silent_entries:
+            rule_state = STATUS_SILENT
+        else:
+            rule_state = STATUS_CLEAR
         results[rule_name] = {
             "triggered": bool(triggered_entries),
             "entries": triggered_entries,
+            "status": rule_state,
+            "silent_entries": silent_entries,
+            "undetermined_entries": undetermined_entries,
         }
     return results

@@ -291,6 +291,11 @@ def validate_scoring_template(template: dict) -> list:
         for key in ("description", "source_label", "consequence"):
             if not rule.get(key):
                 errors.append(f"veto 規則「{rule_name}」缺少 {key}")
+        if "verify_quote" in rule:
+            if not isinstance(rule["verify_quote"], bool):
+                errors.append(f"veto 規則「{rule_name}」的 verify_quote 必須是布林值（true／false）")
+            elif rule["verify_quote"] and rule.get("mode") != "缺失":
+                errors.append(f"veto 規則「{rule_name}」的 verify_quote 只適用缺失型規則（mode 必須是「缺失」）")
     if template.get("veto_rules") and not template.get("veto_label"):
         errors.append("模板有 veto_rules 就必須有 veto_label（報告開頭與章節標題用）")
     return errors

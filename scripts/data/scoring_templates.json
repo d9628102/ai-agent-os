@@ -127,6 +127,7 @@
     "veto_rules": {
       "智財歸屬不完整": {
         "mode": "缺失",
+        "verify_quote": true,
         "description": "完整智財清單與歸屬確認：專利清單、claim chart、原始持有者到公司的智財移轉或授權文件不完整或未取得，公司可能不擁有其技術基礎",
         "criterion_verbatim": "此為三項 Gate 中唯一涉及公司核心資產者。若智財移轉鏈不完整，則 Branes.AI 可能不擁有其技術基礎——此時不論估值高低，本案均不可投資。",
         "source_label": "《Branes.AI 商業模式暨投資盡職調查報告》第玖章 Gate 3「完整智財清單與歸屬確認」",
