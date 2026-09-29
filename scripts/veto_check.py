@@ -264,7 +264,7 @@ def _undetermined(parse_error, rule=None):
     return {
         "status": STATUS_UNDETERMINED, "is_veto_triggered": False, "phenomenon": None, "basis": None,
         "suggested_action": None, "quote": None, "downgrade_reason": None, "missing_pieces": [],
-        "parse_error": parse_error,
+        "parse_error": parse_error, "retried": False, "first_quote": None, "retry_error": None,
     }
 
 
@@ -290,7 +290,7 @@ def parse_verified_absence_response(raw: str, context: str, consequence: str) ->
     result = {
         "status": status, "is_veto_triggered": False, "phenomenon": None, "basis": None,
         "suggested_action": None, "quote": None, "downgrade_reason": None, "missing_pieces": [],
-        "parse_error": None,
+        "parse_error": None, "retried": False, "first_quote": None, "retry_error": None,
     }
     if status != STATUS_ADMITTED:
         return result
@@ -310,6 +310,32 @@ def parse_verified_absence_response(raw: str, context: str, consequence: str) ->
         "suggested_action": parsed.get("suggested_action") or f"在補齊資訊之前，維持「{consequence}」",
     })
     return result
+
+
+def needs_quote_retry(result: dict) -> bool:
+    """第一次判斷之後要不要重試：只有「模型判為承認不完整（admitted），但引文驗證
+    失敗而被降級」這一種情況。降級原因（downgrade_reason）只有在這個情況才會有值，
+    所以模型自己判 silent／clear、解析失敗（undetermined）、admitted 且驗證通過，
+    都不會重試。純邏輯。"""
+    return result.get("status") == STATUS_SILENT and bool(result.get("downgrade_reason"))
+
+
+def build_quote_retry_message(result: dict) -> str:
+    """把驗證失敗的引文告訴模型，請它重新從『文件片段全文』逐字複製。只轉述失敗的
+    事實，不提供任何正確答案，也不放寬任何標準。純邏輯。"""
+    if result.get("downgrade_reason") == REASON_NO_QUOTE:
+        what = "你判為 admitted，但沒有給出足夠長的引文（quote 缺漏或太短）。"
+    else:
+        missing = "、".join(f"「{piece}」" for piece in result.get("missing_pieces") or []) or "（無）"
+        what = (f"你判為 admitted，引用的句子是：「{result.get('quote')}」。"
+                f"程式逐字比對『文件片段全文』後，找不到這些片段：{missing}。")
+    return (
+        f"{what}\n請重新檢查：\n"
+        "1. 如果文件片段裡確實有一句話表示這項資訊目前不完整，請從『文件片段全文』逐字複製那一句"
+        "（一字不差，不能改寫、不能少字或多字、不能換成同義詞）；\n"
+        "2. 如果找不到這樣的句子，請把 status 改成 \"silent\"。\n"
+        "請只輸出同樣格式的 JSON 物件，不要有任何其他文字。"
+    )
 
 
 def detection_status(detection: dict) -> str:
@@ -433,34 +459,72 @@ def detect_veto(rule_name, question, answer, context, chat_url, chat_model, time
 def _detect_verified_absence(rule_name, question, answer, context, chat_url, chat_model, timeout, rules):
     """三態＋引文驗證的單題判斷。輸入與呼叫參數（溫度 0、思考模式、2048 tokens）
     跟原本的缺失型判斷相同，只有 prompt 與解析不同。永遠回傳 dict（含 "rule"），
-    不拋例外。"""
-    payload = {
-        "model": chat_model,
-        "messages": [
-            {"role": "system", "content": _build_verified_absence_prompt(rule_name, rules)},
-            {
-                "role": "user",
-                "content": (
-                    f"問題：{question}\n\n系統回答：\n{answer}\n\n"
-                    f"檢索到的文件片段全文：\n{context}"
-                ),
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": 2048,
-        "chat_template_kwargs": {"enable_thinking": True},
-    }
-    status, resp = http_json("POST", chat_url, payload, timeout=timeout)
+    不拋例外。
+
+    重試（最多一次）：模型判為 admitted、但引文驗證失敗時（needs_quote_retry()），
+    把失敗的引文告訴模型，請它重新從檢索片段逐字複製。重試的輸出走跟第一次完全
+    相同的解析與逐字驗證（parse_verified_absence_response()），標準沒有放寬；
+    重試仍然驗證失敗就照舊降級成 silent。模型自己判 silent／clear、解析失敗、
+    admitted 且驗證通過，都不會多打一次模型。"""
+    consequence = rules[rule_name]["consequence"]
+    messages = [
+        {"role": "system", "content": _build_verified_absence_prompt(rule_name, rules)},
+        {
+            "role": "user",
+            "content": (
+                f"問題：{question}\n\n系統回答：\n{answer}\n\n"
+                f"檢索到的文件片段全文：\n{context}"
+            ),
+        },
+    ]
+
+    def call(msgs):
+        return http_json("POST", chat_url, {
+            "model": chat_model, "messages": msgs, "temperature": 0, "max_tokens": 2048,
+            "chat_template_kwargs": {"enable_thinking": True},
+        }, timeout=timeout)
+
+    status, resp = call(messages)
     if status != 200:
         result = _undetermined(f"呼叫veto判斷模型失敗 (HTTP {status}): {resp}")
     else:
         try:
             raw = resp["choices"][0]["message"].get("content") or ""
-            result = parse_verified_absence_response(raw, context, rules[rule_name]["consequence"])
+            result = parse_verified_absence_response(raw, context, consequence)
         except (KeyError, IndexError, TypeError):
             result = _undetermined(f"veto判斷模型回應格式不如預期: {resp}")
+            raw = None
+        if raw is not None and needs_quote_retry(result):
+            result = _retry_quote_once(result, raw, messages, call, context, consequence)
     result["rule"] = rule_name
     return result
+
+
+def _retry_quote_once(first, first_raw, messages, call, context, consequence):
+    """只呼叫一次。重試的結果如果拿不到可用的判斷（HTTP 失敗、格式不對、輸出壞掉），
+    保留第一次的結果（降級成 silent、附原因），只記錄重試失敗；不會因為重試失敗
+    而把 ⏸ 變成別的狀態。"""
+    retry_messages = messages + [
+        {"role": "assistant", "content": first_raw},
+        {"role": "user", "content": build_quote_retry_message(first)},
+    ]
+    status, resp = call(retry_messages)
+    kept = dict(first, retried=True, first_quote=first.get("quote"))
+    if status != 200:
+        kept["retry_error"] = f"重試呼叫模型失敗 (HTTP {status})"
+        return kept
+    try:
+        raw2 = resp["choices"][0]["message"].get("content") or ""
+    except (KeyError, IndexError, TypeError):
+        kept["retry_error"] = "重試的模型回應格式不如預期"
+        return kept
+    second = parse_verified_absence_response(raw2, context, consequence)
+    if second["status"] == STATUS_UNDETERMINED:
+        kept["retry_error"] = f"重試的輸出無法解析：{(second.get('parse_error') or '')[:120]}"
+        return kept
+    second["retried"] = True
+    second["first_quote"] = first.get("quote")
+    return second
 
 
 def summarize_veto_results(veto_entries, rules=None):
@@ -503,9 +567,12 @@ def summarize_veto_results(veto_entries, rules=None):
                     "suggested_action": det["suggested_action"],
                 })
             elif state == STATUS_SILENT:
+                reason = det.get("downgrade_reason")
+                if reason and det.get("retried"):
+                    reason += "（已請模型重新逐字複製一次，仍無法驗證）"
                 silent_entries.append({
                     "question": entry["question"], "heading": entry.get("heading"),
-                    "reason": det.get("downgrade_reason"),
+                    "reason": reason,
                 })
             elif state == STATUS_UNDETERMINED:
                 undetermined_entries.append({
