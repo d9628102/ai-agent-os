@@ -26,6 +26,19 @@
       }
     },
     {
+      "id": "45a85e72-1fc6-4d9e-a2c4-b7baf5997491",
+      "name": "Encode Question",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        288,
+        120
+      ],
+      "parameters": {
+        "jsCode": "// 問題以 base64 傳給 SSH 指令：base64 只有 A-Za-z0-9+/=，不含任何 shell 特殊字元，\n// 問題文字裡的引號、$()、反引號、換行都不會被 shell 解讀。\nconst raw = $input.item.json['你的問題'];\nconst question_b64 = Buffer.from(String(raw === undefined || raw === null ? '' : raw), 'utf8').toString('base64');\nreturn { question_b64 };\n"
+      }
+    },
+    {
       "id": "b21d37e1-03da-4822-a301-d24b7200d302",
       "name": "Execute a command",
       "type": "n8n-nodes-base.ssh",
@@ -35,7 +48,7 @@
         0
       ],
       "parameters": {
-        "command": "=cd /home/psf01/Desktop/ai-agent-os && python3 scripts/rag_answer.py \"{{ $json['你的問題'] }}\" --show-context"
+        "command": "=cd /home/psf01/Desktop/ai-agent-os && python3 scripts/rag_answer.py --show-context -- \"$(printf '%s' '{{ $json.question_b64 }}' | base64 -d)\""
       },
       "credentials": {
         "sshPassword": {
@@ -54,7 +67,7 @@
         0
       ],
       "parameters": {
-        "jsCode": "const output = $input.item.json.stdout;\nconst match = output.match(/【回答】\\s*([\\s\\S]*?)\\n\\n【耗時】/);\nconst answer = match ? match[1].trim() : output;\n\n// 判斷這題實際上有沒有跑思考模式：可能是整批預設就開啟(DEFAULT_THINKING)，\n// 也可能是 detect_think_reason() 逐題規則覆寫開啟，兩種來源都要認。\nconst think_used = /思考模式\\s*開啟/.test(output) ||\n  /本題自動切換為 --think/.test(output);\n\nconst timeMatch = output.match(/端到端\\s*([\\d.]+)s/);\nconst total_time_s = timeMatch ? parseFloat(timeMatch[1]) : null;\n\nconst tokenMatch = output.match(/輸出\\s*(\\d+)\\s*tokens/);\nconst completion_tokens = tokenMatch ? parseInt(tokenMatch[1], 10) : null;\n\nconst question = $('On form submission').first().json['你的問題'];\n\nconst headingsMatch = output.match(/【檢索到的片段】\\s*([\\s\\S]*?)\\n\\n/);\nconst retrieved_headings = headingsMatch ? headingsMatch[1].trim() : '';\n\nconst contextMatch = output.match(/【送進模型的完整片段內容】\\s*([\\s\\S]*?)\\n\\n【回答】/);\nconst retrieved_context_full = contextMatch ? contextMatch[1].trim() : '';\n\nconst hex = (len) => Array.from({ length: len }, () => Math.floor(Math.random() * 16).toString(16)).join('');\nconst nowMs = Date.now();\nconst startMs = total_time_s ? nowMs - Math.round(total_time_s * 1000) : nowMs;\n\n// Langfuse 只收執行資料（耗時、token 數、成功、模型名稱、腳本名稱）：不送問題、回答、檢索片段。\n// 問題與回答只留在這個節點的輸出（n8n 本機執行紀錄），暫緩複核時從那裡看。\nconst langfuse_body = {\n  resourceSpans: [\n    {\n      resource: {\n        attributes: [\n          { key: \"service.name\", value: { stringValue: \"psf-eim-rag-n8n\" } }\n        ]\n      },\n      scopeSpans: [\n        {\n          scope: { name: \"n8n-psf-eim-rag\" },\n          spans: [\n            {\n              traceId: hex(32),\n              spanId: hex(16),\n              name: \"psf_eim_rag_answer\",\n              kind: 1,\n              startTimeUnixNano: `${startMs}000000`,\n              endTimeUnixNano: `${nowMs}000000`,\n              attributes: [\n                { key: \"langfuse.trace.name\", value: { stringValue: \"psf-eim-rag-qa\" } },\n                { key: \"langfuse.observation.type\", value: { stringValue: \"generation\" } },\n                { key: \"langfuse.observation.model.name\", value: { stringValue: \"Qwen/Qwen3-30B-A3B\" } },\n                { key: \"gen_ai.usage.output_tokens\", value: { intValue: completion_tokens || 0 } },\n                { key: \"langfuse.observation.metadata.think_used\", value: { boolValue: think_used } },\n                { key: \"langfuse.observation.metadata.total_time_s\", value: { doubleValue: total_time_s || 0 } },\n                { key: \"langfuse.observation.metadata.source\", value: { stringValue: \"n8n\" } },\n                { key: \"langfuse.observation.metadata.script\", value: { stringValue: \"rag_answer.py\" } }\n              ],\n              status: { code: 1 }\n            }\n          ]\n        }\n      ]\n    }\n  ]\n};\n\nconst traceId = langfuse_body.resourceSpans[0].scopeSpans[0].spans[0].traceId;\n\nreturn { answer, think_used, total_time_s, completion_tokens, question,\n         retrieved_headings, retrieved_context_full, traceId, langfuse_body };\n"
+        "jsCode": "const output = $input.item.json.stdout;\nconst match = output.match(/【回答】\\s*([\\s\\S]*?)\\n\\n【耗時】/);\nconst answer = match ? match[1].trim() : output;\n\n// 判斷這題實際上有沒有跑思考模式：可能是整批預設就開啟(DEFAULT_THINKING)，\n// 也可能是 detect_think_reason() 逐題規則覆寫開啟，兩種來源都要認。\nconst think_used = /思考模式\\s*開啟/.test(output) ||\n  /本題自動切換為 --think/.test(output);\n\nconst timeMatch = output.match(/端到端\\s*([\\d.]+)s/);\nconst total_time_s = timeMatch ? parseFloat(timeMatch[1]) : null;\n\nconst tokenMatch = output.match(/輸出\\s*(\\d+)\\s*tokens/);\nconst completion_tokens = tokenMatch ? parseInt(tokenMatch[1], 10) : null;\n\nconst inputMatch = output.match(/輸入\\s*(\\d+)\\s*tokens/);\nconst prompt_tokens = inputMatch ? parseInt(inputMatch[1], 10) : null;\n\nconst question = $('On form submission').first().json['你的問題'];\n\nconst headingsMatch = output.match(/【檢索到的片段】\\s*([\\s\\S]*?)\\n\\n/);\nconst retrieved_headings = headingsMatch ? headingsMatch[1].trim() : '';\n\nconst contextMatch = output.match(/【送進模型的完整片段內容】\\s*([\\s\\S]*?)\\n\\n【回答】/);\nconst retrieved_context_full = contextMatch ? contextMatch[1].trim() : '';\n\nconst hex = (len) => Array.from({ length: len }, () => Math.floor(Math.random() * 16).toString(16)).join('');\nconst nowMs = Date.now();\nconst startMs = total_time_s ? nowMs - Math.round(total_time_s * 1000) : nowMs;\n\n// Langfuse 只收執行資料（耗時、token 數、成功、模型名稱、腳本名稱）：不送問題、回答、檢索片段。\n// 問題與回答只留在這個節點的輸出（n8n 本機執行紀錄），暫緩複核時從那裡看。\nconst langfuse_body = {\n  resourceSpans: [\n    {\n      resource: {\n        attributes: [\n          { key: \"service.name\", value: { stringValue: \"psf-eim-rag-n8n\" } }\n        ]\n      },\n      scopeSpans: [\n        {\n          scope: { name: \"n8n-psf-eim-rag\" },\n          spans: [\n            {\n              traceId: hex(32),\n              spanId: hex(16),\n              name: \"psf_eim_rag_answer\",\n              kind: 1,\n              startTimeUnixNano: `${startMs}000000`,\n              endTimeUnixNano: `${nowMs}000000`,\n              attributes: [\n                { key: \"langfuse.trace.name\", value: { stringValue: \"psf-eim-rag-qa\" } },\n                { key: \"langfuse.observation.type\", value: { stringValue: \"generation\" } },\n                { key: \"langfuse.observation.model.name\", value: { stringValue: \"Qwen/Qwen3-30B-A3B\" } },\n                { key: \"gen_ai.usage.input_tokens\", value: { intValue: prompt_tokens || 0 } },\n                { key: \"gen_ai.usage.output_tokens\", value: { intValue: completion_tokens || 0 } },\n                { key: \"langfuse.observation.metadata.think_used\", value: { boolValue: think_used } },\n                { key: \"langfuse.observation.metadata.total_time_s\", value: { doubleValue: total_time_s || 0 } },\n                { key: \"langfuse.observation.metadata.source\", value: { stringValue: \"n8n\" } },\n                { key: \"langfuse.observation.metadata.script\", value: { stringValue: \"rag_answer.py\" } }\n              ],\n              status: { code: 1 }\n            }\n          ]\n        }\n      ]\n    }\n  ]\n};\n\nconst traceId = langfuse_body.resourceSpans[0].scopeSpans[0].spans[0].traceId;\n\nreturn { answer, think_used, total_time_s, completion_tokens, prompt_tokens, question,\n         retrieved_headings, retrieved_context_full, traceId, langfuse_body };\n"
       }
     },
     {
@@ -317,7 +330,7 @@
       "main": [
         [
           {
-            "node": "Execute a command",
+            "node": "Encode Question",
             "type": "main",
             "index": 0
           }
@@ -440,11 +453,23 @@
           }
         ]
       ]
+    },
+    "Encode Question": {
+      "main": [
+        [
+          {
+            "node": "Execute a command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "settings": {
     "executionOrder": "v1",
-    "binaryMode": "separate"
+    "binaryMode": "separate",
+    "errorWorkflow": "PsfEimErrLog0001"
   },
   "meta": {
     "templateCredsSetupCompleted": true

@@ -1,0 +1,110 @@
+{
+  "id": "PsfEimErrLog0001",
+  "name": "PSF EIM Error Logger",
+  "active": true,
+  "nodes": [
+    {
+      "id": "82241612-b03d-43df-ad2e-5969b1eb14e0",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        192,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "e8f1dca9-52dd-4722-b84d-863e2d32527f",
+      "name": "Build Error Trace",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// 只送固定欄位：workflow 名稱、失敗節點名稱（限定在已知節點）、執行編號、時間。\n// 錯誤訊息與堆疊一律不讀、不送：SSH 或 Code 節點的錯誤訊息可能整段包含使用者的問題。\nconst KNOWN_WORKFLOWS = [\"My workflow\", \"PSF EIM QA Approval\"];\nconst KNOWN_NODES = [\"Build Decision Score\", \"Build Pending-Review Tag\", \"Code in JavaScript\", \"Encode Question\", \"Execute a command\", \"Form\", \"IF needs_review\", \"IF valid\", \"Log to Langfuse\", \"On form submission\", \"QA Deterministic Checks\", \"QA LLM Judge\", \"QA Parse & Threshold\", \"Respond Error\", \"Respond OK\", \"Send Decision to Langfuse\", \"Send QA Scores to Langfuse\", \"Tag Pending Review\", \"Webhook\"];\n\nconst e = $input.item.json;\nconst wf = e.workflow || {};\nconst ex = e.execution || {};\nconst workflow_name = KNOWN_WORKFLOWS.includes(wf.name) ? wf.name : 'unknown';\nconst failed_node = KNOWN_NODES.includes(ex.lastNodeExecuted) ? ex.lastNodeExecuted : 'unknown';\nconst execution_id = /^[0-9]{1,12}$/.test(String(ex.id)) ? String(ex.id) : 'unknown';\n\nconst hex = (len) => Array.from({ length: len }, () => Math.floor(Math.random() * 16).toString(16)).join('');\nconst nowMs = Date.now();\n\nconst langfuse_body = {\n  resourceSpans: [\n    {\n      resource: {\n        attributes: [\n          { key: \"service.name\", value: { stringValue: \"psf-eim-rag-n8n\" } }\n        ]\n      },\n      scopeSpans: [\n        {\n          scope: { name: \"n8n-psf-eim-rag\" },\n          spans: [\n            {\n              traceId: hex(32),\n              spanId: hex(16),\n              name: \"psf_eim_workflow_error\",\n              kind: 1,\n              startTimeUnixNano: `${nowMs}000000`,\n              endTimeUnixNano: `${nowMs}000000`,\n              attributes: [\n                { key: \"langfuse.trace.name\", value: { stringValue: \"psf-eim-workflow-error\" } },\n                { key: \"langfuse.observation.level\", value: { stringValue: \"ERROR\" } },\n                { key: \"langfuse.observation.metadata.workflow_name\", value: { stringValue: workflow_name } },\n                { key: \"langfuse.observation.metadata.failed_node\", value: { stringValue: failed_node } },\n                { key: \"langfuse.observation.metadata.execution_id\", value: { stringValue: execution_id } },\n                { key: \"langfuse.observation.metadata.source\", value: { stringValue: \"n8n\" } }\n              ],\n              status: { code: 2 }\n            }\n          ]\n        }\n      ]\n    }\n  ]\n};\n\nreturn { langfuse_body };\n"
+      }
+    },
+    {
+      "id": "f84c3fce-e263-4854-a574-8d7f5bafdb3d",
+      "name": "Send Error to Langfuse",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueRegularOutput",
+      "position": [
+        608,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://cloud.langfuse.com/api/public/otel/v1/traces",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-langfuse-ingestion-version",
+              "value": "4"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.langfuse_body }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "GHsZmLPXPJ0um4Jj",
+          "name": "Langfuse Basic Auth"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Error Trace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Error Trace": {
+      "main": [
+        [
+          {
+            "node": "Send Error to Langfuse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "tags": []
+}

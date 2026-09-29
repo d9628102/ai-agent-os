@@ -241,11 +241,14 @@ def answer_one(question, collection, top_k, max_tokens, temperature,
               f"可調高 --max-tokens，目前 {max_tokens})")
 
     completion_tokens = usage.get("completion_tokens")
+    prompt_tokens = usage.get("prompt_tokens")
     tps = f"{completion_tokens / t_gen:.1f}" if completion_tokens and t_gen > 0 else "N/A"
+    # n8n 表單流程用 regex 從這一行抓數字（輸入／輸出／端到端）：改格式前先看
+    # n8n/workflows/psf-eim-rag-qa-form.json 的 Code in JavaScript 與 tests/test_token_line_compat.py
     print(
         f"\n【耗時】embedding {t_embed:.2f}s | 檢索 {t_search:.2f}s | "
         f"生成 {t_gen:.2f}s | 端到端 {total:.2f}s"
-        f"  (輸出 {completion_tokens or '?'} tokens, 約 {tps} tokens/s)"
+        f"  (輸入 {prompt_tokens or '?'} tokens, 輸出 {completion_tokens or '?'} tokens, 約 {tps} tokens/s)"
     )
 
     return {
@@ -263,6 +266,7 @@ def answer_one(question, collection, top_k, max_tokens, temperature,
         "hits": hits,
         "context": context,
         "completion_tokens": usage.get("completion_tokens"),
+        "prompt_tokens": prompt_tokens,
         "think_used": enable_thinking,
         "thinking": thinking,
     }

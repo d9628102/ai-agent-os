@@ -200,7 +200,8 @@
     }
   },
   "settings": {
-    "executionOrder": "v1"
+    "executionOrder": "v1",
+    "errorWorkflow": "PsfEimErrLog0001"
   },
   "meta": null,
   "pinData": null,

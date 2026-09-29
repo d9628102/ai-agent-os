@@ -157,12 +157,20 @@ def test_handle_override_keeps_free_text_local_and_sends_none_of_it(monkeypatch,
 ALLOWED_TOP_LEVEL = {"id", "name", "active", "nodes", "connections", "settings", "meta", "pinData", "tags"}
 ALLOWED_ATTR_KEYS = {
     "service.name", "langfuse.trace.name", "langfuse.trace.tags", "langfuse.observation.type",
-    "langfuse.observation.model.name", "gen_ai.usage.output_tokens",
+    "langfuse.observation.model.name", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens",
     "langfuse.observation.metadata.think_used", "langfuse.observation.metadata.total_time_s",
     "langfuse.observation.metadata.source", "langfuse.observation.metadata.script",
 }
+# 錯誤記錄 workflow 的屬性白名單：只有 workflow 名稱、失敗節點名稱、執行編號（2026-09 決議，
+# 錯誤訊息與堆疊一律不送）。跟問答 workflow 分開，避免問答那邊順便被放寬。
+ERROR_LOGGER_ATTR_KEYS = {
+    "service.name", "langfuse.trace.name", "langfuse.observation.level",
+    "langfuse.observation.metadata.workflow_name", "langfuse.observation.metadata.failed_node",
+    "langfuse.observation.metadata.execution_id", "langfuse.observation.metadata.source",
+}
+ATTR_KEYS_BY_FILE = {"psf-eim-error-logger.json": ERROR_LOGGER_ATTR_KEYS}
 REQUIRED_RAG_ATTR_KEYS = {
-    "langfuse.observation.model.name", "gen_ai.usage.output_tokens",
+    "langfuse.observation.model.name", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens",
     "langfuse.observation.metadata.total_time_s", "langfuse.observation.metadata.script",
 }
 ALLOWED_BODY_EXPRESSIONS = {
@@ -240,8 +248,9 @@ def _forbidden_in(expr):
     return sorted(set(_FORBIDDEN_RE.findall(_strip_strings(expr))))
 
 
-def audit_workflow(wf):
+def audit_workflow(wf, allowed_attr_keys=None):
     """回傳違規描述清單，空清單代表通過。純邏輯，不執行任何 JS。"""
+    allowed_attr_keys = ALLOWED_ATTR_KEYS if allowed_attr_keys is None else allowed_attr_keys
     problems = []
     raw = json.dumps(wf, ensure_ascii=False)
 
@@ -277,7 +286,7 @@ def audit_workflow(wf):
         if code and re.search(r"resourceSpans|langfuse|batch\s*:", code):
             body_code = _strip_js_comments(code)
             for key in re.findall(r"key:\s*\"([^\"]+)\"", body_code):
-                if key not in ALLOWED_ATTR_KEYS:
+                if key not in allowed_attr_keys:
                     problems.append(f"{name}：屬性 key 不在白名單：{key}")
             for line in body_code.splitlines():
                 if re.search(r"key:\s*\"", line) and "value:" in line:
@@ -311,12 +320,12 @@ APPROVAL = WORKFLOWS["psf-eim-qa-approval.json"]
 
 
 def test_workflow_export_files_present():
-    assert sorted(WORKFLOWS) == ["psf-eim-qa-approval.json", "psf-eim-rag-qa-form.json"]
+    assert sorted(WORKFLOWS) == ["psf-eim-error-logger.json", "psf-eim-qa-approval.json", "psf-eim-rag-qa-form.json"]
 
 
 @pytest.mark.parametrize("filename", sorted(WORKFLOWS))
 def test_real_workflow_exports_pass_audit(filename):
-    assert audit_workflow(WORKFLOWS[filename]) == []
+    assert audit_workflow(WORKFLOWS[filename], ATTR_KEYS_BY_FILE.get(filename)) == []
 
 
 def _node(wf, name):
