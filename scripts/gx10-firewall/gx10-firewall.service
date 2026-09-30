@@ -1,0 +1,29 @@
+# GX10 防火牆：開機時載入 nft 表 inet gx10_fw（SSH 與 8000、8001、6333、6334 只允許區網）。
+# 安裝位置：/etc/systemd/system/gx10-firewall.service（由 fw-install.sh 安裝；安裝後預設「不啟用」）。
+# 設計重點：
+#   - 在網路配置之前（Before=network-pre.target）、也在 ssh.socket 與 Docker 之前載入，暴露時間約等於 0
+#   - 失敗時「放行」（不會留下半套規則；nft 是整個檔案一起成功或一起失敗）並觸發警報（OnFailure）
+#   - 不使用 Requires=：防火牆失敗不能拖垮 Docker 或 SSH
+#   - ExecStartPost 與 ExecStop 前面的「-」表示：紀錄腳本失敗或表不存在都不算服務失敗（否則紀錄腳本出錯會讓已載入成功的服務被判失敗、並觸發停止動作刪掉表）
+#   - 重新載入用 reload（規則檔內是「建立→刪除→重建」同一個交易，沒有空窗）；stop 只刪我們的表，不碰 Docker 的規則
+[Unit]
+Description=GX10 LAN-only firewall (nft table inet gx10_fw)
+Documentation=file:///etc/gx10-fw/README.txt
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target sysinit.target shutdown.target
+After=systemd-modules-load.service
+Conflicts=shutdown.target
+OnFailure=gx10-firewall-alert.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/sbin/nft -c -f /etc/gx10-fw/gx10_fw.nft
+ExecStart=/usr/sbin/nft -f /etc/gx10-fw/gx10_fw.nft
+ExecStartPost=-/usr/local/sbin/gx10-fw-record loaded
+ExecReload=/usr/sbin/nft -f /etc/gx10-fw/gx10_fw.nft
+ExecStop=-/usr/sbin/nft delete table inet gx10_fw
+
+[Install]
+WantedBy=sysinit.target

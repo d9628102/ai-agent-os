@@ -1,0 +1,31 @@
+# 步驟 2 + n8n 的 5678：SSH、大型模型 8000、向量模型 8001、Qdrant 6333／6334 與 n8n 5678 只允許區網（含 n8n 的 5678，2026-09-30 加入 5678）。
+# input 鏈：本機、n8n 容器、IPv6 的連線；forward 鏈：從區網被 Docker 轉送給容器的 IPv4 連線。
+add table inet gx10_fw
+delete table inet gx10_fw
+table inet gx10_fw {
+  set lan4 {
+    type ipv4_addr
+    flags interval
+    elements = { 127.0.0.0/8, 192.168.1.0/24, 172.17.0.0/16 }
+  }
+  set lan6 {
+    type ipv6_addr
+    flags interval
+    elements = { ::1, fe80::/10 }
+  }
+  chain input {
+    type filter hook input priority -10; policy accept;
+    ct state established,related accept
+    iifname "lo" accept
+    tcp dport 22 ip saddr @lan4 accept
+    tcp dport 22 ip6 saddr @lan6 accept
+    tcp dport 22 counter drop
+    tcp dport { 8000, 8001, 6333, 6334, 5678 } ip saddr @lan4 accept
+    tcp dport { 8000, 8001, 6333, 6334, 5678 } ip6 saddr @lan6 accept
+    tcp dport { 8000, 8001, 6333, 6334, 5678 } counter drop
+  }
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    ct status dnat ct original proto-dst { 8000, 8001, 6333, 6334, 5678 } ip saddr != @lan4 counter drop
+  }
+}

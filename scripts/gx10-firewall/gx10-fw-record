@@ -1,0 +1,18 @@
+#!/bin/bash
+# 防火牆成功載入時寫一筆紀錄：時間、表雜湊前 12 碼。寫到系統日誌與 /var/log/gx10-fw-alert.log。
+# 由 gx10-firewall.service 的 ExecStartPost 呼叫（參數：loaded）。無論如何都結束碼 0（紀錄失敗不能讓服務失敗）。
+# 順便移除舊的失敗旗標 /run/gx10-fw-FAILED（表示這次已成功載入）。
+# 安裝位置：/usr/local/sbin/gx10-fw-record（root:root 755）。不含任何密碼。
+# 表雜湊 = nft -s list table inet gx10_fw（不含計數）的 sha256 前 12 碼，同一份規則永遠得到同一個值。
+# 測試用環境變數（平常不設定）：GX10_FW_LOG 紀錄檔路徑、GX10_FW_FLAG 旗標檔路徑
+LOG="${GX10_FW_LOG:-/var/log/gx10-fw-alert.log}"
+FLAG="${GX10_FW_FLAG:-/run/gx10-fw-FAILED}"
+EVENT="${1:-loaded}"
+HASH="$(nft -s list table inet gx10_fw 2>/dev/null | sha256sum | cut -c1-12)"
+[ -n "$HASH" ] || HASH="unknown"
+LINE="$(date '+%Y-%m-%d %H:%M:%S') $EVENT table=gx10_fw hash=$HASH"
+logger -t gx10-firewall -p auth.notice "$LINE" 2>/dev/null
+echo "<5>gx10-firewall: $LINE"
+echo "$LINE" >> "$LOG" 2>/dev/null
+rm -f "$FLAG" 2>/dev/null
+exit 0

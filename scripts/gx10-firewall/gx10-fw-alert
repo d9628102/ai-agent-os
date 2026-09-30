@@ -1,0 +1,15 @@
+#!/bin/bash
+# 防火牆載入失敗的警報。只做兩件事（都不會失敗中斷）：
+#   1. 寫一筆最高等級（crit）系統日誌
+#   2. 建立旗標檔 /run/gx10-fw-FAILED（內容：時間與說明；/run 每次開機都會清空，成功載入時會被移除）
+# 安裝位置：/usr/local/sbin/gx10-fw-alert（root:root 755）。不含任何密碼。
+# 測試用環境變數（平常不設定）：GX10_FW_FLAG 旗標檔路徑
+FLAG="${GX10_FW_FLAG:-/run/gx10-fw-FAILED}"
+NOW="$(date '+%Y-%m-%d %H:%M:%S')"
+MSG="GX10 防火牆載入失敗：表 gx10_fw 沒有載入（目前等於沒有這層防火牆，8000 與 SSH 對區網以外開放）。查原因：journalctl -b -u gx10-firewall.service ；說明：/etc/gx10-fw/README.txt"
+# 1. 系統日誌 crit：優先用 logger（寫入 journal 與 syslog）；標準輸出加 <2> 前綴，由 systemd 記成 crit 等級（雙保險）
+logger -t gx10-firewall -p daemon.crit "$MSG" 2>/dev/null
+echo "<2>gx10-firewall: $MSG"
+# 2. 旗標檔
+{ echo "$NOW"; echo "$MSG"; } > "$FLAG" 2>/dev/null && chmod 644 "$FLAG" 2>/dev/null
+exit 0

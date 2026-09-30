@@ -1,0 +1,10 @@
+# GX10 防火牆載入失敗時的警報（由 gx10-firewall.service 的 OnFailure= 觸發）。
+# 只做兩件事：① 寫一筆最高等級（crit）系統日誌 ② 建立旗標檔 /run/gx10-fw-FAILED。
+# 安裝位置：/etc/systemd/system/gx10-firewall-alert.service（由 fw-install.sh 安裝）。
+[Unit]
+Description=GX10 firewall load FAILED - alert
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gx10-fw-alert
