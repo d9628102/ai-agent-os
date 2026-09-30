@@ -18,7 +18,7 @@ import pytest
 
 import gx10_backup_serve as S
 
-SECRET = "OUTSIDE_SECRET_5f2c"
+OUTSIDE_MARKER = "OUTSIDE_SECRET_5f2c"
 CANARY = "CANARY_QA_TEXT_31de"
 
 
@@ -35,8 +35,8 @@ def env(tmp_path):
     bad.mkdir()
     (bad / "data.txt").write_text("partial")          # 沒有 DONE
     (st / "LATEST").write_text("20260929-171000\n")
-    (tmp_path / "secret.txt").write_text(SECRET)      # STAGING 外面的機密
-    (tmp_path / "authorized_keys").write_text(SECRET)
+    (tmp_path / "secret.txt").write_text(OUTSIDE_MARKER)      # STAGING 外面的機密
+    (tmp_path / "authorized_keys").write_text(OUTSIDE_MARKER)
     return dict(staging=str(st), log_path=str(tmp_path / "serve.log"), tmp=tmp_path)
 
 
@@ -91,12 +91,12 @@ def test_get_missing_backup_returns_3(env):
 def test_everything_else_is_refused_and_leaks_nothing(env, cmd):
     rc, out, _ = call(env, cmd)
     assert rc in (2, 3)
-    assert SECRET.encode() not in out and b"root:" not in out
+    assert OUTSIDE_MARKER.encode() not in out and b"root:" not in out
 
 
 def test_nothing_outside_staging_is_ever_readable(env):
     for cmd in ("get ../secret.txt", "get ../authorized_keys", "get ....-......"):
-        assert SECRET.encode() not in call(env, cmd)[1]
+        assert OUTSIDE_MARKER.encode() not in call(env, cmd)[1]
 
 
 def test_serving_never_modifies_staging(env):
@@ -111,4 +111,4 @@ def test_log_has_actions_but_no_content(env):
     call(env, "get ../secret.txt")
     text = open(env["log_path"], encoding="utf-8").read()
     assert "get 20260929-171000" in text and "格式不合法" in text
-    assert CANARY not in text and SECRET not in text
+    assert CANARY not in text and OUTSIDE_MARKER not in text
