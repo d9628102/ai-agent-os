@@ -198,12 +198,12 @@ start_qdrant() {
     log "拉取映像: ${QDRANT_IMAGE}"
     docker pull "${QDRANT_IMAGE}" || die "拉取 Qdrant 映像失敗,請檢查網路連線。"
 
-    log "執行: docker run -d --name ${QDRANT_CONTAINER_NAME} -p ${QDRANT_HTTP_PORT}:6333 -p ${QDRANT_GRPC_PORT}:6334 -v ${QDRANT_STORAGE_DIR}:/qdrant/storage ${QDRANT_IMAGE}"
+    log "執行: docker run -d --name ${QDRANT_CONTAINER_NAME} -p 127.0.0.1:${QDRANT_HTTP_PORT}:6333 -p 127.0.0.1:${QDRANT_GRPC_PORT}:6334 -v ${QDRANT_STORAGE_DIR}:/qdrant/storage ${QDRANT_IMAGE}"
     docker run -d \
       --name "${QDRANT_CONTAINER_NAME}" \
       --restart unless-stopped \
-      -p "${QDRANT_HTTP_PORT}:6333" \
-      -p "${QDRANT_GRPC_PORT}:6334" \
+      -p "127.0.0.1:${QDRANT_HTTP_PORT}:6333" \
+      -p "127.0.0.1:${QDRANT_GRPC_PORT}:6334" \
       -v "${QDRANT_STORAGE_DIR}:/qdrant/storage" \
       "${QDRANT_IMAGE}" \
       || die "docker run 啟動 Qdrant 失敗。"
@@ -310,7 +310,7 @@ start_embedding_service() {
     warn "未設定 HF_TOKEN,下載 ${EMBED_MODEL_HANDLE} 可能被 Hugging Face Hub 限速(見 docs/gx10-known-issues.md #3)。"
   fi
 
-  log "執行: docker run -d --name ${EMBED_CONTAINER_NAME} --gpus all -p ${EMBED_PORT}:8000 ... vllm serve ${EMBED_MODEL_HANDLE} --runner pooling"
+  log "執行: docker run -d --name ${EMBED_CONTAINER_NAME} --gpus all -p 127.0.0.1:${EMBED_PORT}:8000 ... vllm serve ${EMBED_MODEL_HANDLE} --runner pooling"
 
   EMBED_START_TS="$(date +%s)"
 
@@ -318,7 +318,7 @@ start_embedding_service() {
     --name "${EMBED_CONTAINER_NAME}" \
     --restart unless-stopped \
     --gpus all \
-    -p "${EMBED_PORT}:8000" \
+    -p "127.0.0.1:${EMBED_PORT}:8000" \
     -v "${HF_CACHE_DIR}:/root/.cache/huggingface" \
     "${hf_token_args[@]}" \
     "${EMBED_VLLM_IMAGE}" \
