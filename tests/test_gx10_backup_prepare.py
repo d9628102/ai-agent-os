@@ -267,3 +267,16 @@ def test_backed_up_config_is_byte_identical_to_the_source(env):
     go(env)
     src = os.path.join(env["n8n_dir"], "config")
     assert open(os.path.join(latest(env), "n8n", "config"), "rb").read() == open(src, "rb").read()
+
+
+def test_container_images_are_pinned_not_latest():
+    """Restore-verify and the setup script must not float on 'latest' (or an untagged image)."""
+    import re
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    for rel in ("scripts/gx10_backup_verify.py", "scripts/gx10-rag-setup.sh"):
+        text = (root / rel).read_text(encoding="utf-8")
+        assert "latest" not in text, rel
+        for image in re.findall(r"""["'{:\-]((?:qdrant/qdrant|n8nio/n8n)[^\s"'}]*)""", text):
+            assert re.fullmatch(r"(?:qdrant/qdrant|n8nio/n8n):v?\d+\.\d+\.\d+", image), (rel, image)
+

@@ -71,7 +71,7 @@ def check_qdrant(bdir, manifest, tmp):
     sh(["docker", "rm", "-f", QDRANT_TEST])
     sh(["docker", "volume", "rm", "-f", QDRANT_VOLUME])
     # 用 docker 具名資料卷而不是資料夾：Qdrant 在容器裡以 root 寫檔，資料夾會留下我們刪不掉的檔案
-    r = sh(["docker", "run", "-d", "--name", QDRANT_TEST, "-p", f"127.0.0.1:{QDRANT_PORT}:6333", "-v", f"{QDRANT_VOLUME}:/qdrant/storage", "qdrant/qdrant"])
+    r = sh(["docker", "run", "-d", "--name", QDRANT_TEST, "-p", f"127.0.0.1:{QDRANT_PORT}:6333", "-v", f"{QDRANT_VOLUME}:/qdrant/storage", "qdrant/qdrant:v1.19.1"])
     if r.returncode != 0:
         return ["無法啟動測試用 Qdrant 容器"], detail
     url = f"http://127.0.0.1:{QDRANT_PORT}"
@@ -107,7 +107,7 @@ def check_n8n(bdir, manifest, tmp):
         problems.append("config 雜湊與備份時不符")
     sh(["docker", "rm", "-f", N8N_TEST])
     r = sh(["docker", "run", "-d", "--name", N8N_TEST, "-p", f"127.0.0.1:{N8N_PORT}:5678", "-v", f"{ndir}:/home/node/.n8n",
-            "-e", "N8N_SECURE_COOKIE=false", "-e", "N8N_DIAGNOSTICS_ENABLED=false", "n8nio/n8n"])
+            "-e", "N8N_SECURE_COOKIE=false", "-e", "N8N_DIAGNOSTICS_ENABLED=false", "n8nio/n8n:2.39.6"])
     if r.returncode != 0:
         return problems + ["無法啟動測試用 n8n 容器"], detail
     if not wait_http(f"http://127.0.0.1:{N8N_PORT}/healthz", 120):
