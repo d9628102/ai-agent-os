@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.psf.gx10-backup</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>/Users/YOUR_USER/bin/gx10-backup.sh</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>GX10_BACKUP_HOST</key><string>user@host</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/tmp/gx10-backup.err</string>
+</dict>
+</plist>
