@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """GX10 備份整理（每晚由 root 排程執行）。規格：/home/psf01/trial/backup-spec.md
 
-把要備份的東西整理成一份「一致的備份包」，放在 STAGING/<日期時間>/，由 Mac 用唯讀金鑰來拉取
-（Mac 端限制成 rrsync -ro，只看得到 STAGING）。GX10 上不存任何 Mac 的密碼。
+把要備份的東西整理成一份「一致的備份包」，放在 STAGING/<日期時間>/，由 Mac 用受限的 SSH 金鑰拉取
+（authorized_keys 的強制指令 gx10_backup_serve.py，只允許 latest／failed／get；不再使用 rrsync）。
+GX10 上不存任何 Mac 的密碼。
 
 備份內容
   qdrant/<集合>.snapshot   Qdrant 快照（線上、一致；集合名稱每次現查）
@@ -21,6 +22,18 @@
   - 權限：資料夾 700、檔案 600、擁有者 OWNER_UID（內含問答全文與憑證加密金鑰）
   - log 只有筆數、大小、雜湊，不含問答內容
 結束碼：0 成功；1 失敗。
+
+Usage:
+  python3 gx10_backup_prepare.py                    # 全部用預設值（正式排程就是這樣呼叫）
+  python3 gx10_backup_prepare.py --staging DIR --qdrant-url URL --n8n-dir DIR --trial-dir DIR --keep N --log FILE
+  參數都有預設值：STAGING=/home/psf01/backup-staging、Qdrant=http://localhost:6333、
+  n8n 資料夾=/var/lib/docker/volumes/n8n_data/_data、trial=/home/psf01/trial、KEEP=2、
+  log=/home/psf01/trial/backup/backup.log。
+  執行身分：root。正式用法是 root 的 crontab 每日 02:30 執行；需要 root 的原因是 n8n 資料卷路徑為 root 專屬、
+  並讀取 root 的 crontab；以 root 執行時會把產出的擁有者改成 OWNER_UID（1000）。
+  非 root 執行時 n8n 備份步驟預期會失敗（依路徑權限推斷，未實測）。
+  需要的外部條件：Qdrant 在上述網址可連線、docker 指令可用（讀取四個容器的建立參數）。
+  結束碼：0 成功；1 失敗（STAGING/FAILED 會寫下失敗步驟）。
 """
 import argparse
 import datetime

@@ -11,6 +11,16 @@
   4 壓縮檔：trial.tar.gz 與 eval 壓縮檔能完整讀取（含 CRC），trial 內有預期的檔案
 容器與暫存資料夾一律在結束時清除。報告（只有通過／失敗與筆數，不含內容）存成
 /home/psf01/trial/backup/restore-test-<時間>.json。
+
+Usage:
+  python3 gx10_backup_verify.py [備份資料夾]
+    不給備份資料夾就用 STAGING/LATEST 指的那一份（STAGING=/home/psf01/backup-staging）。
+  執行身分：一般使用者即可（需在 docker 群組），不需要 root；以 root 執行時會多做 chown。
+  外部條件：docker 可用；本機已有映像 qdrant/qdrant:v1.19.1 與 n8nio/n8n:2.39.6
+  （沒有的話 docker run 會嘗試下載，需要網路）；127.0.0.1 的 6335 與 5680 埠未被占用。
+  不碰正式服務：只起拋棄式容器 qdrant-restore-test、n8n-restore-test 與具名 volume，結束時清除。
+  輸出：標準輸出每項通過／失敗；報告檔 /home/psf01/trial/backup/restore-test-<時間>.json（只有通過／失敗與筆數）。
+  結束碼：0 全部通過；1 有失敗（這份備份視為無效）。
 """
 import datetime
 import json

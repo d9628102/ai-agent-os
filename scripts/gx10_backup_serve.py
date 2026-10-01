@@ -10,6 +10,16 @@
 名稱用嚴格格式比對，所以不可能用 .. 或斜線讀到 STAGING 以外的東西；不寫入任何東西、不執行任何外部指令。
 每次呼叫寫一行 log（時間、動作、結果，不含備份內容）。
 結束碼：0 成功；2 不允許的指令或名稱不合法；3 沒有這個檔；4 備份沒有 DONE。
+
+Usage:
+  不是手動執行的腳本：由 sshd 依 ~/.ssh/authorized_keys 的 command="/usr/bin/python3 <本檔路徑>" 呼叫，
+  動作從環境變數 SSH_ORIGINAL_COMMAND 讀取（Mac 端用 ssh 帶入下列其中一個動作）：
+    ssh <帳號>@<GX10> latest
+    ssh <帳號>@<GX10> failed
+    ssh <帳號>@<GX10> get <YYYYMMDD-HHMMSS>      # 輸出 tar 串流
+  執行身分：該 authorized_keys 所屬的一般使用者（目前為 psf01），不需要 root。
+  只讀取 STAGING（/home/psf01/backup-staging）；唯一寫入的是 /home/psf01/trial/backup/serve.log。
+  結束碼：0 成功；2 不允許的指令或名稱不合法；3 沒有這個檔；4 備份沒有 DONE。
 """
 import datetime
 import os
