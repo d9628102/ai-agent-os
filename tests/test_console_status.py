@@ -765,3 +765,95 @@ def test_import_has_no_side_effects_and_main_requires_explicit_run(tmp_path, mon
     monkeypatch.setattr(C, "run", lambda *a, **k: {"called": a})
     monkeypatch.setenv("CONSOLE_OUT_DIR", str(tmp_path))
     assert C.main([]) == 0
+
+
+# ── 第 13 項快取只存原始數量，每次用目前基準重算 ──
+N8N_CMD = ("docker", "exec", "n8n", "node", "-e")
+
+
+def _n8n_calls(e):
+    return sum(1 for c in e.calls if c[:3] == ["docker", "exec", "n8n"])
+
+
+def _set_counts(e, failures=0, logger=0, waiting=18):
+    e.cmds[N8N_CMD] = (0, json.dumps({"failures_24h": failures, "logger_triggers": logger, "waiting": waiting}) + "\n")
+
+
+def test_n8n_cache_stores_raw_counts_not_the_increase_flag():
+    e = make_env()
+    _set_counts(e, failures=2, logger=1, waiting=18)
+    data, st = C.collect_all(e, CFG, {})
+    assert st["n8n_cache"]["counts"] == {"failures_24h": 2, "logger_triggers": 1, "waiting": 18}
+    assert "value" not in st["n8n_cache"] and "waiting_increase" not in st["n8n_cache"]["counts"]
+    assert data["n8n_exec"]["waiting_increase"] is True          # 沒有基準、waiting > 0
+
+
+def test_cached_counts_are_reevaluated_with_the_current_baseline():
+    e = make_env()
+    _set_counts(e)
+    data1, st = C.collect_all(e, CFG, {})
+    assert color(C.evaluate(data1, NOW_MS), 13) == "yellow"        # 沒有基準：視為增加
+    st["waiting_baseline"] = 18                                    # 基準更新（例如每日執行寫入）
+    e.t = NOW + 60
+    data2, st2 = C.collect_all(e, CFG, st)
+    assert _n8n_calls(e) == 1                                      # 仍在快取期間，沒有重查
+    assert data2["n8n_exec"]["waiting_increase"] is False and data2["n8n_exec"]["waiting"] == 18
+    assert color(C.evaluate(data2, int((NOW + 60) * 1000)), 13) == "green"   # 基準一改，下一次執行就生效，不用等快取過期
+    st2["waiting_baseline"] = 17
+    e.t = NOW + 120
+    data3, _ = C.collect_all(e, CFG, st2)
+    assert _n8n_calls(e) == 1 and data3["n8n_exec"]["waiting_increase"] is True
+
+
+def test_cached_counts_keep_failures_and_logger_between_queries():
+    e = make_env()
+    _set_counts(e, failures=3, logger=3, waiting=0)
+    _, st = C.collect_all(e, CFG, {})
+    e.t = NOW + 300
+    data, _ = C.collect_all(e, CFG, st)
+    assert _n8n_calls(e) == 1
+    assert data["n8n_exec"]["failures_24h"] == 3 and data["n8n_exec"]["logger_triggers"] == 3
+    assert color(C.evaluate(data, int((NOW + 300) * 1000)), 13) == "red"
+
+
+def test_old_cache_format_is_still_accepted():
+    e = make_env()
+    old = {"at": NOW, "value": {"responsive": True, "failures_24h": 0, "logger_triggers": 0, "waiting_increase": True, "waiting": 18}}
+    e.t = NOW + 10
+    data, _ = C.collect_all(e, CFG, {"n8n_cache": old, "waiting_baseline": 18})
+    assert _n8n_calls(e) == 0
+    assert data["n8n_exec"]["waiting_increase"] is False
+
+
+@pytest.mark.parametrize("bad", [
+    {"at": NOW, "counts": {"failures_24h": True, "logger_triggers": 0, "waiting": 1}},
+    {"at": NOW, "counts": {"failures_24h": -1, "logger_triggers": 0, "waiting": 1}},
+    {"at": NOW, "counts": {"failures_24h": 0, "logger_triggers": 0}},
+    {"at": NOW, "counts": {"failures_24h": "0", "logger_triggers": 0, "waiting": 1}},
+    {"at": NOW, "counts": "x"},
+    {"at": NOW},
+])
+def test_malformed_cache_is_ignored_and_requeried(bad):
+    e = make_env()
+    _set_counts(e, waiting=5)
+    e.t = NOW + 10
+    data, st = C.collect_all(e, CFG, {"n8n_cache": bad})
+    assert _n8n_calls(e) == 1
+    assert st["n8n_cache"]["counts"]["waiting"] == 5
+
+
+def test_daily_run_sets_baseline_and_the_next_cached_run_uses_it(tmp_path):
+    e = make_env()
+    _set_counts(e, waiting=18)
+    out = tmp_path / "console"
+    out.mkdir()
+    C.run(str(out / "status.json"), daily=True, out_dir=str(out), env=e, cfg=CFG)
+    state = json.loads((out / "state.json").read_text())
+    assert state["waiting_baseline"] == 18
+    first = json.loads((out / "status.json").read_text())
+    assert next(i for i in first["items"] if i["id"] == 13)["color"] == "yellow"       # 第一次沒有基準
+    e.t = NOW + 300
+    C.run(str(out / "status.json"), daily=False, out_dir=str(out), env=e, cfg=CFG)
+    assert _n8n_calls(e) == 1                                                           # 快取沒有過期
+    second = json.loads((out / "status.json").read_text())
+    assert next(i for i in second["items"] if i["id"] == 13)["color"] == "green"       # 但基準已生效

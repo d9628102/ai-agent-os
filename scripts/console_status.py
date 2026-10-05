@@ -656,16 +656,41 @@ N8N_QUERY_JS = (
 )
 
 
-def collect_n8n_exec(env, cfg, responsive, waiting_baseline=None):
+def query_n8n_counts(env, cfg):
+    """容器內唯讀查詢，只回傳原始數量（失敗次數、Error Logger 觸發次數、waiting 數量）。"""
     rc, out = env.run(["docker", "exec", cfg["n8n_container"], "node", "-e", N8N_QUERY_JS,
                        cfg["n8n_db_path"], cfg["n8n_logger_workflow"]], N8N_TIMEOUT)
     if rc != 0:
         raise RuntimeError("n8n 統計查詢失敗")
     q = json.loads(out.strip().splitlines()[-1])
-    waiting = int(q["waiting"])
+    return {"failures_24h": int(q["failures_24h"]), "logger_triggers": int(q["logger_triggers"]),
+            "waiting": int(q["waiting"])}
+
+
+def build_n8n_exec(counts, responsive, waiting_baseline=None):
+    """用「目前」的基準重新算 waiting 是否增加；快取只存原始數量，不存這個判斷，所以基準一改馬上生效。"""
+    waiting = counts["waiting"]
     increase = waiting > waiting_baseline if isinstance(waiting_baseline, int) else waiting > 0
-    return {"responsive": responsive, "failures_24h": int(q["failures_24h"]),
-            "logger_triggers": int(q["logger_triggers"]), "waiting_increase": increase, "waiting": waiting}
+    return {"responsive": responsive, "failures_24h": counts["failures_24h"],
+            "logger_triggers": counts["logger_triggers"], "waiting_increase": increase, "waiting": waiting}
+
+
+def collect_n8n_exec(env, cfg, responsive, waiting_baseline=None):
+    return build_n8n_exec(query_n8n_counts(env, cfg), responsive, waiting_baseline)
+
+
+def _cached_counts(cache):
+    """取出快取裡的原始數量；也相容舊格式（舊版把整包結果放在 value 裡）。格式不對就當作沒有快取。"""
+    src = cache.get("counts") if isinstance(cache.get("counts"), dict) else cache.get("value")
+    if not isinstance(src, dict):
+        return None
+    out = {}
+    for k in ("failures_24h", "logger_triggers", "waiting"):
+        v = src.get(k)
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            return None
+        out[k] = v
+    return out
 
 
 def collect_tests(env, cfg):
@@ -708,16 +733,16 @@ def collect_all(env, cfg=None, state=None, timeout=COLLECT_TIMEOUT):
         state["restart_counts"] = data["containers"].get("restart_counts", {})
     health = data.get("health", {}).get("checks", [])
     responsive = any(c["name"] == "n8n" and c["code"] == 200 for c in health)
+    counts = None
     cache = state.get("n8n_cache")
-    if isinstance(cache, dict) and now - cache.get("at", 0) < N8N_CACHE_SECONDS and isinstance(cache.get("value"), dict):
-        value = dict(cache["value"])
-        value["responsive"] = responsive
-        data["n8n_exec"] = value
-    else:
-        v = call_with_timeout(lambda: collect_n8n_exec(env, cfg, responsive, state.get("waiting_baseline")), N8N_TIMEOUT + 5)
-        if v is not None:
-            data["n8n_exec"] = v
-            state["n8n_cache"] = {"at": now, "value": v}
+    if isinstance(cache, dict) and now - cache.get("at", 0) < N8N_CACHE_SECONDS:
+        counts = _cached_counts(cache)
+    if counts is None:
+        counts = call_with_timeout(lambda: query_n8n_counts(env, cfg), N8N_TIMEOUT + 5)
+        if counts is not None:
+            state["n8n_cache"] = {"at": now, "counts": counts}
+    if counts is not None:
+        data["n8n_exec"] = build_n8n_exec(counts, responsive, state.get("waiting_baseline"))
     return data, state
 
 
@@ -753,7 +778,9 @@ def run(out_path, daily=False, out_dir=None, env=None, cfg=None):
         prune_summaries(out_dir, today)
         state["restart_baseline"] = state.get("restart_counts", state.get("restart_baseline", {}))
         if isinstance(state.get("n8n_cache"), dict):
-            state["waiting_baseline"] = state["n8n_cache"].get("value", {}).get("waiting", state.get("waiting_baseline"))
+            c = _cached_counts(state["n8n_cache"])
+            if c is not None:
+                state["waiting_baseline"] = c["waiting"]
     write_atomic(state_path, json.dumps({k: v for k, v in state.items()}, ensure_ascii=False) + "\n")
     return status
 

@@ -182,3 +182,48 @@ def test_no_secrets_or_real_addresses_in_source():
     assert not re.search(r"(?i)\b(password|passwd|secret|api_key|token)\s*=\s*[\"']", src)
     assert not re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", src)
     assert "psf01" not in src
+
+
+# ── serve.log 的權限一律 600 ──
+def _mode(path):
+    return os.stat(path).st_mode & 0o777
+
+
+def test_new_log_file_is_created_with_mode_600_even_with_open_umask(env):
+    log = os.path.join(env["out_dir"], "serve.log")
+    old = os.umask(0)
+    try:
+        call(env, "status")
+    finally:
+        os.umask(old)
+    assert _mode(log) == 0o600
+
+
+def test_existing_wide_log_is_tightened_before_writing_and_content_kept(env):
+    log = os.path.join(env["out_dir"], "serve.log")
+    with open(log, "w", encoding="utf-8") as f:
+        f.write("2026-01-01 00:00:00 舊的一行\n")
+    os.chmod(log, 0o664)
+    call(env, "status")
+    assert _mode(log) == 0o600
+    lines = open(log, encoding="utf-8").read().splitlines()
+    assert lines[0].endswith("舊的一行") and len(lines) == 2 and lines[1].endswith(" status")
+
+
+def test_log_mode_stays_600_after_many_calls(env):
+    log = os.path.join(env["out_dir"], "serve.log")
+    for cmd in ("status", "summary", "x", ""):
+        call(env, cmd)
+        assert _mode(log) == 0o600
+
+
+def test_log_is_opened_with_mode_600_directly_not_relying_on_a_later_chmod(env, monkeypatch):
+    modes = []
+    real_open = os.open
+
+    def spy(path, flags, mode=0o777, **kw):
+        modes.append(mode)
+        return real_open(path, flags, mode, **kw)
+    monkeypatch.setattr(F.os, "open", spy)
+    call(env, "status")
+    assert modes == [0o600]

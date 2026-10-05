@@ -3,16 +3,17 @@
 
 在暫存目錄的副本上改 scripts/console_status.py 或 scripts/console_forced_command.py，真正的檔案完全不動。
 每一種突變都必須讓對應的測試檔失敗（「抓到」）；沒抓到的會列出來，不隱藏。
-Usage: python3 tests/mutate_console_status.py
+Usage: python3 tests/mutate_console_status.py   （另有 --check-only 靜態檢查、--self-test 證明防呆有效；防呆見 tests/mutation_guard.py）
 """
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mutation_guard as guard
+from mutation_guard import CAUGHT, SURVIVED, INVALID, RUNTIME
 ST, FC = "console_status.py", "console_forced_command.py"
 
 
@@ -173,6 +174,20 @@ M = [
     ("強制指令：非字串輸入不處理", FC, sub('    if not isinstance(original_command, str):\n        original_command = ""\n', "")),
     ("強制指令：log 寫失敗就丟例外", FC, sub("    except OSError:\n        pass\n\n\ndef serve", "    except OSError:\n        raise\n\n\ndef serve")),
     ("強制指令：混入真實 IP", FC, sub("MAX_BYTES = 1_000_000", "MAX_BYTES = 1_000_000\nHOST = '203.0.113.9'")),
+    # ── 第 13 項快取只存原始數量／serve.log 權限 ──
+    ("n8n 快取後的判斷不用目前基準", ST, sub('data["n8n_exec"] = build_n8n_exec(counts, responsive, state.get("waiting_baseline"))', 'data["n8n_exec"] = build_n8n_exec(counts, responsive, None)')),
+    ("n8n 增加判斷 > 改 >=", ST, sub("increase = waiting > waiting_baseline if isinstance", "increase = waiting >= waiting_baseline if isinstance")),
+    ("每日執行不更新 waiting 基準", ST, sub('                state["waiting_baseline"] = c["waiting"]', '                state["waiting_baseline"] = state.get("waiting_baseline")')),
+    ("每日基準取錯欄位", ST, sub('state["waiting_baseline"] = c["waiting"]', 'state["waiting_baseline"] = c["failures_24h"]')),
+    ("快取格式不驗證", ST, sub("        if isinstance(v, bool) or not isinstance(v, int) or v < 0:\n            return None", "        pass")),
+    ("快取只認舊格式", ST, sub('src = cache.get("counts") if isinstance(cache.get("counts"), dict) else cache.get("value")', 'src = cache.get("value")')),
+    ("快取只認新格式", ST, sub('else cache.get("value")', 'else None')),
+    ("快取連判斷旗標一起存", ST, sub('state["n8n_cache"] = {"at": now, "counts": counts}', 'state["n8n_cache"] = {"at": now, "counts": dict(counts, waiting_increase=True)}')),
+    ("log 新檔權限改 644", FC, sub("os.O_CREAT, 0o600)", "os.O_CREAT, 0o644)")),
+    ("log 新檔權限放寬到 666", FC, sub("os.O_CREAT, 0o600)", "os.O_CREAT, 0o666)")),
+    ("不收緊既有的寬權限 log", FC, sub("if st.st_uid == os.getuid() and (st.st_mode & 0o077):", "if False:")),
+    ("收緊成 644", FC, sub("os.fchmod(fd, 0o600)", "os.fchmod(fd, 0o644)")),
+    ("log 改成每次覆寫", FC, sub("os.O_WRONLY | os.O_APPEND | os.O_CREAT", "os.O_WRONLY | os.O_TRUNC | os.O_CREAT")),
 ]
 
 TEST_FOR = {ST: "test_console_status.py", FC: "test_console_forced_command.py"}
@@ -192,35 +207,49 @@ def check_replacements():
     print("靜態自我檢查通過：%d 個突變的替換文字都沒有執行輸入的寫法" % len(REPL))
 
 
+def all_rels():
+    return [Path("scripts") / ST, Path("scripts") / FC] + [Path("tests") / t for t in TEST_FOR.values()]
+
+
+def baseline(runner=None):
+    """未突變的複本必須全部通過（兩個測試檔都要）。"""
+    return guard.run_baseline(ROOT, all_rels(), [Path("tests") / t for t in TEST_FOR.values()], runner)
+
+
+def evaluate_mutation(fname, fn, drop=None, runner=None):
+    return guard.evaluate(ROOT, all_rels(), Path("tests") / TEST_FOR[fname], Path("scripts") / fname, fn, drop=drop, runner=runner)
+
+
+def self_check():
+    """證明兩道保護有效（不執行任何突變程式碼）。回傳問題清單。"""
+    problems = guard.self_test()
+    for fname, other in ((ST, FC), (FC, ST)):
+        problems += ["%s：%s" % (fname, q) for q in guard.check_harness(
+            ROOT, all_rels(), Path("tests") / TEST_FOR[fname], Path("scripts") / fname, Path("scripts") / other)]
+    return problems
+
+
 def main():
     check_replacements()
+    if "--self-test" in sys.argv:
+        problems = self_check()
+        print("保護自我檢查：%s" % ("全部正常" if not problems else "有問題"))
+        for q in problems:
+            print("  -", q)
+        sys.exit(0 if not problems else 5)
     if "--check-only" in sys.argv:
         return
-    ok, survivors = 0, []
+    ok, detail = baseline()
+    if not ok:
+        print("中止：" + detail)
+        sys.exit(3)
+    print("未突變的複本全部通過，開始跑突變")
+    results = []
     for label, fname, fn in M:
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            (td / "scripts").mkdir()
-            (td / "tests").mkdir()
-            for f in (ST, FC):
-                shutil.copy(ROOT / "scripts" / f, td / "scripts" / f)
-            for t in TEST_FOR.values():
-                shutil.copy(ROOT / "tests" / t, td / "tests" / t)
-            target = td / "scripts" / fname
-            target.write_text(fn(target.read_text(encoding="utf-8")), encoding="utf-8")
-            r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider",
-                                str(td / "tests" / TEST_FOR[fname])], capture_output=True, text=True, timeout=300)
-            killed = r.returncode != 0
-            ok += killed
-            if not killed:
-                survivors.append(label)
-            print("%s  %s" % ("抓到" if killed else "沒抓到", label), flush=True)
-    print("\n抓到 %d／總共 %d" % (ok, len(M)))
-    if survivors:
-        print("沒抓到：")
-        for s in survivors:
-            print("  -", s)
-    sys.exit(0 if not survivors else 1)
+        cat, detail = evaluate_mutation(fname, fn)
+        results.append((label, cat, detail))
+        print("%s  %s" % ({CAUGHT: "抓到", RUNTIME: "執行期例外", SURVIVED: "沒抓到", INVALID: "無效結果"}[cat], label), flush=True)
+    sys.exit(guard.summarize(results))
 
 
 if __name__ == "__main__":

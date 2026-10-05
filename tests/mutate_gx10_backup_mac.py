@@ -2,19 +2,27 @@
 """Mutation harness for tests/test_gx10_backup_mac.py.
 
 Works on a temporary copy (scripts/gx10-backup-mac + the test); the real files are never touched.
-Each mutation must make the test file fail. Usage: python3 tests/mutate_gx10_backup_mac.py
+Each mutation must make the test file fail with an assertion (see tests/mutation_guard.py: unmutated baseline must pass first;
+collection/import errors, timeouts and incomplete copies are "invalid"; non-assertion runtime exceptions are a separate
+"runtime_exception" category, never counted as caught).
+Usage: python3 tests/mutate_gx10_backup_mac.py   (--check-only: static check only; --self-test: prove the guards work)
 """
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mutation_guard as guard
+from mutation_guard import CAUGHT, SURVIVED, INVALID, RUNTIME
+
+REPL = []        # 所有突變的替換文字，供開跑前的靜態自我檢查掃描
+
 
 def sub(old, new):
+    REPL.append(new)
+
     def f(t):
         assert old in t, "mutation anchor missing: %r" % old
         return t.replace(old, new, 1)
@@ -48,27 +56,62 @@ M = [
 ]
 
 
+# 會把輸入交給外殼或執行任意程式的寫法：任何突變的替換文字都不得含有
+FORBIDDEN = re.compile(r"(?i)os\.system|\.system\s*\(|subprocess|popen|\beval\b|\bexec|shell|sh\s+-c")
+PKG = Path("scripts") / "gx10-backup-mac"
+TEST_REL = Path("tests") / "test_gx10_backup_mac.py"
+
+
+def check_replacements():
+    """執行任何突變之前的靜態自我檢查：掃描所有突變的替換文字，含危險字樣就中止，不執行任何測試。"""
+    bad = [t[:60] for t in REPL if FORBIDDEN.search(t)]
+    if bad:
+        print("靜態自我檢查失敗：下列突變的替換文字含有會執行輸入的寫法，已中止，沒有執行任何測試：")
+        for b in bad:
+            print("  -", repr(b))
+        sys.exit(2)
+    print("靜態自我檢查通過：%d 個突變的替換文字都沒有執行輸入的寫法" % len(REPL))
+
+
+def all_rels():
+    return guard.list_files(ROOT, PKG) + [TEST_REL]
+
+
+def baseline(runner=None):
+    """未突變的複本必須全部通過。"""
+    return guard.run_baseline(ROOT, all_rels(), [TEST_REL], runner)
+
+
+def evaluate_mutation(fname, fn, drop=None, runner=None):
+    return guard.evaluate(ROOT, all_rels(), TEST_REL, PKG / fname, fn, drop=drop, runner=runner)
+
+
+def self_check():
+    """證明兩道保護有效（不執行任何突變程式碼）。回傳問題清單。"""
+    return guard.self_test() + guard.check_harness(ROOT, all_rels(), TEST_REL, PKG / SH, PKG / RD)
+
+
 def main():
-    ok, survivors = 0, []
+    check_replacements()
+    if "--self-test" in sys.argv:
+        problems = self_check()
+        print("保護自我檢查：%s" % ("全部正常" if not problems else "有問題"))
+        for q in problems:
+            print("  -", q)
+        sys.exit(0 if not problems else 5)
+    if "--check-only" in sys.argv:
+        return
+    ok, detail = baseline()
+    if not ok:
+        print("中止：" + detail)
+        sys.exit(3)
+    print("未突變的複本全部通過，開始跑突變")
+    results = []
     for label, fname, fn in M:
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            (td / "tests").mkdir()
-            shutil.copytree(ROOT / "scripts" / "gx10-backup-mac", td / "scripts" / "gx10-backup-mac")
-            shutil.copy(ROOT / "tests" / "test_gx10_backup_mac.py", td / "tests")
-            target = td / "scripts" / "gx10-backup-mac" / fname
-            target.write_text(fn(target.read_text(encoding="utf-8")) if target.exists() else fn(""), encoding="utf-8")
-            r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider",
-                                str(td / "tests" / "test_gx10_backup_mac.py")], capture_output=True, text=True)
-            killed = r.returncode != 0
-            ok += killed
-            if not killed:
-                survivors.append(label)
-            print("%s  %s" % ("抓到" if killed else "沒抓到", label))
-    print("\n抓到 %d／總共 %d" % (ok, len(M)))
-    if survivors:
-        print("沒抓到：", survivors)
-    sys.exit(0 if not survivors else 1)
+        cat, detail = evaluate_mutation(fname, fn)
+        results.append((label, cat, detail))
+        print("%s  %s" % ({CAUGHT: "抓到", RUNTIME: "執行期例外", SURVIVED: "沒抓到", INVALID: "無效結果"}[cat], label), flush=True)
+    sys.exit(guard.summarize(results))
 
 
 if __name__ == "__main__":

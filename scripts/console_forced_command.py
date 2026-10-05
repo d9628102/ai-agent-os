@@ -15,7 +15,7 @@ Usage:
   動作從環境變數 SSH_ORIGINAL_COMMAND 讀取（Mac 端用 ssh 帶入下列其中一個動作）：
     ssh <帳號>@<GX10> status
     ssh <帳號>@<GX10> summary
-  讀取目錄預設 ~/trial/console（可用環境變數 CONSOLE_OUT_DIR 覆蓋）；唯一寫入的是同目錄的 serve.log。
+  讀取目錄預設 ~/trial/console（可用環境變數 CONSOLE_OUT_DIR 覆蓋）；唯一寫入的是同目錄的 serve.log（權限 600）。
   執行身分：該 authorized_keys 所屬的一般使用者，不需要 root。
   這個檔案這次只放進 repo，沒有部署、沒有動 authorized_keys。
 """
@@ -37,8 +37,16 @@ def _safe(text, limit=40):
 
 
 def _log(msg, log_path):
+    """附加一行 log。新檔用 os.open 直接指定 600（不靠 umask）；既有檔案若屬於目前使用者且權限較寬，寫入前先收緊成 600。"""
     try:
-        with open(log_path, "a", encoding="utf-8") as f:
+        fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            st = os.fstat(fd)
+            if st.st_uid == os.getuid() and (st.st_mode & 0o077):
+                os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write("%s %s\n" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
     except OSError:
         pass
