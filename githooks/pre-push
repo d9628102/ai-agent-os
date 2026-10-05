@@ -69,6 +69,8 @@ declare -A TEST_TO_LOGIC=(
   ["tests/test_gate_check.py"]="scripts/gate_check.py"
   ["tests/test_veto_template_rules.py"]="scripts/veto_check.py"
   ["tests/test_letter_report_helpers.py"]="scripts/generate_report.py"
+  ["tests/test_console_status.py"]="scripts/console_status.py"
+  ["tests/test_console_forced_command.py"]="scripts/console_forced_command.py"
 )
 
 run_pytest() {
