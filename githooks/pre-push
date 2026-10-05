@@ -71,6 +71,8 @@ declare -A TEST_TO_LOGIC=(
   ["tests/test_letter_report_helpers.py"]="scripts/generate_report.py"
   ["tests/test_console_status.py"]="scripts/console_status.py"
   ["tests/test_console_forced_command.py"]="scripts/console_forced_command.py"
+  ["tests/test_console_pull.py"]="scripts/gx10-console-mac/console_pull.py"
+  ["tests/test_mutation_guard.py"]="tests/mutation_guard.py"
 )
 
 run_pytest() {
